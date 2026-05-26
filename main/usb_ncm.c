@@ -17,6 +17,7 @@ typedef struct {
 } usb_ncm_driver_t;
 
 static usb_ncm_driver_t s_driver;
+static volatile bool s_connected;
 
 static esp_err_t usb_ncm_transmit(void *h, void *buffer, size_t len)
 {
@@ -63,8 +64,14 @@ static void usb_ncm_port_event_handler(void *arg, esp_event_base_t base, int32_t
     }
 }
 
+bool usb_ncm_is_connected(void)
+{
+    return s_connected;
+}
+
 static void usb_ncm_init_cb(void *ctx)
 {
+    s_connected = true;
     ESP_LOGI(TAG, "USB NCM initialized by host");
     void *handle = &s_driver;
     esp_event_post(ETH_EVENT, ETHERNET_EVENT_START, &handle, sizeof(handle), 0);

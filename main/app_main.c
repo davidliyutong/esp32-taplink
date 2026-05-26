@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_wifi.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 
@@ -15,13 +16,49 @@
 
 static const char *TAG = "main";
 
+#define LED_GPIO      GPIO_NUM_21
+#define BUTTON_GPIO   GPIO_NUM_0
+#define RESET_HOLD_MS 5000
+
 static netlink_config_t s_config;
+static volatile bool s_booting = true;
+
+static void led_button_task(void *arg)
+{
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_direction(BUTTON_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BUTTON_GPIO, GPIO_PULLUP_ONLY);
+
+    uint32_t btn_held_ms = 0;
+
+    while (1) {
+        int blink_ms = s_booting ? 100 : (usb_ncm_is_connected() ? 1000 : 500);
+
+        gpio_set_level(LED_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(blink_ms));
+        gpio_set_level(LED_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(blink_ms));
+
+        if (gpio_get_level(BUTTON_GPIO) == 0) {
+            btn_held_ms += blink_ms * 2;
+            if (btn_held_ms >= RESET_HOLD_MS) {
+                ESP_LOGW(TAG, "Factory reset triggered by long press");
+                gpio_set_level(LED_GPIO, 1);
+                nvs_flash_erase();
+                vTaskDelay(pdMS_TO_TICKS(500));
+                esp_restart();
+            }
+        } else {
+            btn_held_ms = 0;
+        }
+    }
+}
 
 void app_main(void)
 {
     ESP_LOGI(TAG, "esp32-netlink starting (version: %s)", FIRMWARE_VERSION);
 
-    gpio_set_direction(GPIO_NUM_21, GPIO_MODE_OUTPUT);
+    xTaskCreate(led_button_task, "led_btn", 2048, NULL, 1, NULL);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -45,19 +82,9 @@ void app_main(void)
     ESP_ERROR_CHECK(bridge_start(br_netif, usb_netif, wifi_netif));
 
     ESP_ERROR_CHECK(wifi_ap_start(&s_config));
-
-    gpio_set_level(GPIO_NUM_21, 1);
-
     ESP_ERROR_CHECK(usb_ncm_start());
-
     ESP_ERROR_CHECK(web_server_start(&s_config));
 
+    s_booting = false;
     ESP_LOGI(TAG, "All systems up. Bridge ready.");
-
-    while (1) {
-        gpio_set_level(GPIO_NUM_21, 1);
-        vTaskDelay(pdMS_TO_TICKS(500));
-        gpio_set_level(GPIO_NUM_21, 0);
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
 }

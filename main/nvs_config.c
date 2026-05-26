@@ -16,6 +16,8 @@ void config_get_defaults(netlink_config_t *cfg)
     strcpy(cfg->admin_password, "admin");
     cfg->dhcp_subnet = inet_addr("192.168.4.0");
     cfg->dhcp_prefix_len = 24;
+    cfg->dhcp_gw_enabled = 1;
+    cfg->dhcp_dns_enabled = 0;
 }
 
 esp_err_t config_load(netlink_config_t *cfg)
@@ -43,6 +45,8 @@ esp_err_t config_load(netlink_config_t *cfg)
 
     nvs_get_u32(handle, "dhcp_ip", &cfg->dhcp_subnet);
     nvs_get_u8(handle, "dhcp_pfx", &cfg->dhcp_prefix_len);
+    nvs_get_u8(handle, "dhcp_gw", &cfg->dhcp_gw_enabled);
+    nvs_get_u8(handle, "dhcp_dns", &cfg->dhcp_dns_enabled);
 
     nvs_close(handle);
 
@@ -63,6 +67,8 @@ esp_err_t config_save(const netlink_config_t *cfg)
     nvs_set_str(handle, "admin_pass", cfg->admin_password);
     nvs_set_u32(handle, "dhcp_ip", cfg->dhcp_subnet);
     nvs_set_u8(handle, "dhcp_pfx", cfg->dhcp_prefix_len);
+    nvs_set_u8(handle, "dhcp_gw", cfg->dhcp_gw_enabled);
+    nvs_set_u8(handle, "dhcp_dns", cfg->dhcp_dns_enabled);
 
     err = nvs_commit(handle);
     nvs_close(handle);

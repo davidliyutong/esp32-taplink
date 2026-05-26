@@ -1,9 +1,14 @@
 #include "web_server.h"
+#include "bridge.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_netif.h"
+#include "esp_netif_net_stack.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
+#include "lwip/etharp.h"
+#include "lwip/tcpip.h"
 #include <string.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
@@ -95,6 +100,7 @@ static bool get_form_value(const char *body, const char *key, char *out, size_t 
     snprintf(search, sizeof(search), "%s=", key);
     const char *p = strstr(body, search);
     if (!p) return false;
+    if (p != body && *(p - 1) != '&') return false;
     p += strlen(search);
     const char *end = strchr(p, '&');
     size_t len = end ? (size_t)(end - p) : strlen(p);
@@ -114,16 +120,108 @@ static const char HTML_HEADER[] =
     "<title>ESP32-NetLink</title>"
     "<style>"
     "body{font-family:system-ui,sans-serif;max-width:480px;margin:40px auto;padding:0 20px;background:#f5f5f5}"
-    ".card{background:#fff;border-radius:8px;padding:24px;box-shadow:0 2px 4px rgba(0,0,0,.1)}"
+    ".card{background:#fff;border-radius:8px;padding:24px;box-shadow:0 2px 4px rgba(0,0,0,.1);margin-bottom:16px}"
     "h1{color:#333;font-size:1.4em;margin:0 0 20px}"
+    "h2{color:#555;font-size:1.1em;margin:0 0 12px}"
     "label{display:block;margin:12px 0 4px;color:#555;font-size:.9em}"
     "input[type=text],input[type=password]{width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box;font-size:1em}"
     "button{background:#2196F3;color:#fff;border:none;padding:10px 24px;border-radius:4px;cursor:pointer;font-size:1em;margin-top:16px;width:100%}"
     "button:hover{background:#1976D2}"
     ".msg{background:#E8F5E9;color:#2E7D32;padding:12px;border-radius:4px;margin-bottom:16px}"
-    "</style></head><body><div class='card'>";
+    "table{width:100%;border-collapse:collapse;font-size:.9em}"
+    "th,td{padding:8px;text-align:left;border-bottom:1px solid #eee}"
+    "th{color:#888;font-weight:500}"
+    ".toggle{display:flex;align-items:center;gap:8px;margin:12px 0}"
+    ".toggle input{width:auto;margin:0}"
+    "a{color:#2196F3}"
+    ".empty{color:#999;font-style:italic;padding:12px 0}"
+    "</style></head><body>";
 
-static const char HTML_FOOTER[] = "</div></body></html>";
+static const char HTML_FOOTER[] = "</body></html>";
+
+/* ---- ARP client enumeration ---- */
+
+typedef struct {
+    uint32_t ip;
+    uint8_t mac[6];
+} client_entry_t;
+
+static int get_clients(client_entry_t *out, int max_clients)
+{
+    esp_netif_t *br = bridge_get_netif();
+    if (!br) return 0;
+
+    struct netif *br_lwip = esp_netif_get_netif_impl(br);
+    if (!br_lwip) return 0;
+
+    esp_netif_ip_info_t ip_info;
+    esp_netif_get_ip_info(br, &ip_info);
+
+    int count = 0;
+    LOCK_TCPIP_CORE();
+    for (size_t i = 0; i < ARP_TABLE_SIZE && count < max_clients; i++) {
+        ip4_addr_t *ip = NULL;
+        struct netif *netif = NULL;
+        struct eth_addr *mac = NULL;
+        if (etharp_get_entry(i, &ip, &netif, &mac)) {
+            if (netif == br_lwip && ip->addr != ip_info.ip.addr) {
+                out[count].ip = ip->addr;
+                memcpy(out[count].mac, mac->addr, 6);
+                count++;
+            }
+        }
+    }
+    UNLOCK_TCPIP_CORE();
+    return count;
+}
+
+/* ---- GET / (dashboard) ---- */
+
+static esp_err_t dashboard_handler(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_auth_required(req);
+
+    client_entry_t clients[10];
+    int client_count = get_clients(clients, 10);
+
+    char page[3072];
+    int pos = 0;
+
+    pos += snprintf(page + pos, sizeof(page) - pos,
+        "%s<div class='card'><h1>ESP32-NetLink</h1>"
+        "<h2>Connected Devices</h2>",
+        HTML_HEADER);
+
+    if (client_count == 0) {
+        pos += snprintf(page + pos, sizeof(page) - pos,
+            "<p class='empty'>No devices connected</p>");
+    } else {
+        pos += snprintf(page + pos, sizeof(page) - pos,
+            "<table><tr><th>IP Address</th><th>MAC Address</th></tr>");
+        for (int i = 0; i < client_count && pos < (int)sizeof(page) - 128; i++) {
+            uint8_t *ip = (uint8_t *)&clients[i].ip;
+            uint8_t *m = clients[i].mac;
+            pos += snprintf(page + pos, sizeof(page) - pos,
+                "<tr><td>%d.%d.%d.%d</td>"
+                "<td>%02x:%02x:%02x:%02x:%02x:%02x</td></tr>",
+                ip[0], ip[1], ip[2], ip[3],
+                m[0], m[1], m[2], m[3], m[4], m[5]);
+        }
+        pos += snprintf(page + pos, sizeof(page) - pos, "</table>");
+    }
+
+    pos += snprintf(page + pos, sizeof(page) - pos,
+        "</div>"
+        "<a href='/config' style='display:block;text-align:center;background:#2196F3;color:#fff;"
+        "padding:10px 24px;border-radius:4px;text-decoration:none;font-size:1em;margin-top:16px'>"
+        "Settings</a>"
+        "%s",
+        HTML_FOOTER);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, page, pos);
+    return ESP_OK;
+}
 
 /* ---- GET /config ---- */
 
@@ -131,32 +229,45 @@ static esp_err_t config_get_handler(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_auth_required(req);
 
+    uint8_t *sn = (uint8_t *)&s_cfg->dhcp_subnet;
     char ip_str[16];
-    struct in_addr subnet_addr = {.s_addr = s_cfg->dhcp_subnet};
-    inet_ntoa_r(subnet_addr, ip_str, sizeof(ip_str));
+    snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d", sn[0], sn[1], sn[2], sn[3]);
 
-    char page[2048];
-    int len = snprintf(page, sizeof(page),
-        "%s"
+    char page[4096];
+    int pos = 0;
+
+    pos += snprintf(page + pos, sizeof(page) - pos, "%s<div class='card'>", HTML_HEADER);
+    pos += snprintf(page + pos, sizeof(page) - pos,
         "<h1>ESP32-NetLink Settings</h1>"
         "<form method='POST' action='/config'>"
         "<label>WiFi SSID</label>"
         "<input type='text' name='wifi_ssid' value='%s' maxlength='32' required>"
         "<label>WiFi Password</label>"
-        "<input type='password' name='wifi_pass' value='%s' maxlength='64'>"
+        "<input type='password' name='wifi_pass' value='%s' maxlength='64'>",
+        s_cfg->wifi_ssid, s_cfg->wifi_password);
+    pos += snprintf(page + pos, sizeof(page) - pos,
         "<label>DHCP Subnet (e.g. 192.168.4.0/24)</label>"
         "<input type='text' name='dhcp_subnet' value='%s/%d' required>"
+        "<div class='toggle'>"
+        "<input type='checkbox' name='dhcp_gw' id='dhcp_gw' value='1'%s>"
+        "<label for='dhcp_gw' style='margin:0'>Advertise gateway in DHCP</label></div>"
+        "<div class='toggle'>"
+        "<input type='checkbox' name='dhcp_dns' id='dhcp_dns' value='1'%s>"
+        "<label for='dhcp_dns' style='margin:0'>Advertise DNS in DHCP</label></div>",
+        ip_str, s_cfg->dhcp_prefix_len,
+        s_cfg->dhcp_gw_enabled ? " checked" : "",
+        s_cfg->dhcp_dns_enabled ? " checked" : "");
+    pos += snprintf(page + pos, sizeof(page) - pos,
         "<label>Admin Password</label>"
         "<input type='password' name='admin_pass' value='%s' maxlength='64' required>"
         "<button type='submit'>Save &amp; Reboot</button>"
-        "</form>"
-        "%s",
-        HTML_HEADER,
-        s_cfg->wifi_ssid,
-        s_cfg->wifi_password,
-        ip_str, s_cfg->dhcp_prefix_len,
-        s_cfg->admin_password,
-        HTML_FOOTER);
+        "</form></div>"
+        "<a href='/' style='display:block;text-align:center;background:#757575;color:#fff;"
+        "padding:10px 24px;border-radius:4px;text-decoration:none;font-size:1em;margin-top:16px'>"
+        "Back to Dashboard</a>%s",
+        s_cfg->admin_password, HTML_FOOTER);
+
+    int len = pos < (int)sizeof(page) ? pos : (int)sizeof(page) - 1;
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, page, len);
@@ -204,6 +315,12 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         }
     }
 
+    char gw_val[4];
+    new_cfg.dhcp_gw_enabled = get_form_value(body, "dhcp_gw", gw_val, sizeof(gw_val)) ? 1 : 0;
+
+    char dns_val[4];
+    new_cfg.dhcp_dns_enabled = get_form_value(body, "dhcp_dns", dns_val, sizeof(dns_val)) ? 1 : 0;
+
     if (strlen(new_cfg.wifi_ssid) == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID cannot be empty");
         return ESP_FAIL;
@@ -220,30 +337,21 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     }
     *s_cfg = new_cfg;
 
-    char page[1280];
+    char page[2048];
     int len = snprintf(page, sizeof(page),
-        "%s"
+        "%s<div class='card'>"
         "<div class='msg'>Settings saved. Rebooting in 3 seconds...</div>"
         "<h1>ESP32-NetLink</h1>"
         "<p>Please reconnect after reboot.</p>"
-        "%s",
+        "</div>%s",
         HTML_HEADER, HTML_FOOTER);
+    if (len >= (int)sizeof(page)) len = sizeof(page) - 1;
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, page, len);
 
     TimerHandle_t timer = xTimerCreate("restart", pdMS_TO_TICKS(3000), pdFALSE, NULL, restart_cb);
     xTimerStart(timer, 0);
-    return ESP_OK;
-}
-
-/* ---- GET / ---- */
-
-static esp_err_t root_handler(httpd_req_t *req)
-{
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "/config");
-    httpd_resp_send(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -263,8 +371,8 @@ esp_err_t web_server_start(netlink_config_t *cfg)
         return err;
     }
 
-    const httpd_uri_t root = {
-        .uri = "/", .method = HTTP_GET, .handler = root_handler,
+    const httpd_uri_t dashboard = {
+        .uri = "/", .method = HTTP_GET, .handler = dashboard_handler,
     };
     const httpd_uri_t config_get = {
         .uri = "/config", .method = HTTP_GET, .handler = config_get_handler,
@@ -273,7 +381,7 @@ esp_err_t web_server_start(netlink_config_t *cfg)
         .uri = "/config", .method = HTTP_POST, .handler = config_post_handler,
     };
 
-    httpd_register_uri_handler(server, &root);
+    httpd_register_uri_handler(server, &dashboard);
     httpd_register_uri_handler(server, &config_get);
     httpd_register_uri_handler(server, &config_post);
 

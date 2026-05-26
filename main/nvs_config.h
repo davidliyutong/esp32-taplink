@@ -9,6 +9,8 @@ typedef struct {
     char admin_password[65];
     uint32_t dhcp_subnet;
     uint8_t dhcp_prefix_len;
+    uint8_t dhcp_gw_enabled;
+    uint8_t dhcp_dns_enabled;
 } netlink_config_t;
 
 void config_get_defaults(netlink_config_t *cfg);
