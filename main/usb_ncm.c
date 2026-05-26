@@ -34,7 +34,10 @@ static esp_err_t usb_ncm_recv_cb(void *buffer, uint16_t len, void *ctx)
     usb_ncm_driver_t *driver = (usb_ncm_driver_t *)ctx;
     if (driver->base.netif) {
         void *buf_copy = malloc(len);
-        if (!buf_copy) return ESP_ERR_NO_MEM;
+        if (!buf_copy) {
+            ESP_LOGW(TAG, "rx drop: alloc failed (%u bytes)", len);
+            return ESP_ERR_NO_MEM;
+        }
         memcpy(buf_copy, buffer, len);
         esp_netif_receive(driver->base.netif, buf_copy, len, buf_copy);
     }
@@ -69,14 +72,21 @@ bool usb_ncm_is_connected(void)
     return s_connected;
 }
 
+static void usb_event_cb(tinyusb_event_t *event, void *arg)
+{
+    if (event->id == TINYUSB_EVENT_DETACHED) {
+        s_connected = false;
+        ESP_LOGW(TAG, "USB host disconnected");
+        void *handle = &s_driver;
+        esp_event_post(ETH_EVENT, ETHERNET_EVENT_DISCONNECTED, &handle, sizeof(handle), 0);
+    }
+}
+
 static void usb_ncm_init_cb(void *ctx)
 {
-    if (s_connected) {
-        ESP_LOGI(TAG, "USB NCM re-enumerated by host");
-        return;
-    }
+    bool reconnect = s_connected;
     s_connected = true;
-    ESP_LOGI(TAG, "USB NCM initialized by host");
+    ESP_LOGI(TAG, "USB NCM %s by host", reconnect ? "re-initialized" : "initialized");
     void *handle = &s_driver;
     esp_event_post(ETH_EVENT, ETHERNET_EVENT_START, &handle, sizeof(handle), 0);
     esp_event_post(ETH_EVENT, ETHERNET_EVENT_CONNECTED, &handle, sizeof(handle), 0);
@@ -142,7 +152,7 @@ esp_netif_t *usb_ncm_netif_create(void)
 
 esp_err_t usb_ncm_start(void)
 {
-    const tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+    const tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG(usb_event_cb);
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
     tinyusb_net_config_t net_cfg = {

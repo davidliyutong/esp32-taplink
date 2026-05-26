@@ -5,6 +5,7 @@
 #include "esp_eth_com.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
+#include "dhcpserver/dhcpserver.h"
 #include <arpa/inet.h>
 
 static const char *TAG = "bridge";
@@ -48,7 +49,21 @@ esp_netif_t *bridge_create(const netlink_config_t *cfg)
     s_br_netif = esp_netif_new(&br_cfg);
     assert(s_br_netif);
 
-    ESP_LOGI(TAG, "Bridge created, IP=" IPSTR " gw=%s dns=%s",
+    uint32_t lease_time = 60;
+    esp_netif_dhcps_option(s_br_netif, ESP_NETIF_OP_SET,
+                           ESP_NETIF_IP_ADDRESS_LEASE_TIME,
+                           &lease_time, sizeof(lease_time));
+
+    dhcps_lease_t pool = {
+        .enable = true,
+        .start_ip.addr = cfg->dhcp_subnet | htonl(2),
+        .end_ip.addr   = cfg->dhcp_subnet | htonl(11),
+    };
+    esp_netif_dhcps_option(s_br_netif, ESP_NETIF_OP_SET,
+                           ESP_NETIF_REQUESTED_IP_ADDRESS,
+                           &pool, sizeof(pool));
+
+    ESP_LOGI(TAG, "Bridge created, IP=" IPSTR " gw=%s dns=%s pool=.2-.11 lease=1h",
              IP2STR(&ip_info.ip),
              cfg->dhcp_gw_enabled ? "on" : "off",
              cfg->dhcp_dns_enabled ? "on" : "off");

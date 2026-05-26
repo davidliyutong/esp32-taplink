@@ -6,3 +6,4 @@
 
 esp_netif_t *wifi_ap_create(void);
 esp_err_t wifi_ap_start(const netlink_config_t *cfg);
+int wifi_ap_get_sta_count(void);
