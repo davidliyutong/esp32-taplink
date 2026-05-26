@@ -18,6 +18,8 @@ void config_get_defaults(netlink_config_t *cfg)
     cfg->dhcp_prefix_len = 24;
     cfg->dhcp_gw_enabled = 1;
     cfg->dhcp_dns_enabled = 0;
+    cfg->wifi_tx_power = 80;
+    cfg->wifi_channel = 0;
 }
 
 esp_err_t config_load(netlink_config_t *cfg)
@@ -47,6 +49,8 @@ esp_err_t config_load(netlink_config_t *cfg)
     nvs_get_u8(handle, "dhcp_pfx", &cfg->dhcp_prefix_len);
     nvs_get_u8(handle, "dhcp_gw", &cfg->dhcp_gw_enabled);
     nvs_get_u8(handle, "dhcp_dns", &cfg->dhcp_dns_enabled);
+    nvs_get_i8(handle, "wifi_txp", &cfg->wifi_tx_power);
+    nvs_get_u8(handle, "wifi_ch", &cfg->wifi_channel);
 
     nvs_close(handle);
 
@@ -69,6 +73,8 @@ esp_err_t config_save(const netlink_config_t *cfg)
     nvs_set_u8(handle, "dhcp_pfx", cfg->dhcp_prefix_len);
     nvs_set_u8(handle, "dhcp_gw", cfg->dhcp_gw_enabled);
     nvs_set_u8(handle, "dhcp_dns", cfg->dhcp_dns_enabled);
+    nvs_set_i8(handle, "wifi_txp", cfg->wifi_tx_power);
+    nvs_set_u8(handle, "wifi_ch", cfg->wifi_channel);
 
     err = nvs_commit(handle);
     nvs_close(handle);

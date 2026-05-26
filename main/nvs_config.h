@@ -11,6 +11,8 @@ typedef struct {
     uint8_t dhcp_prefix_len;
     uint8_t dhcp_gw_enabled;
     uint8_t dhcp_dns_enabled;
+    int8_t wifi_tx_power;
+    uint8_t wifi_channel;
 } netlink_config_t;
 
 void config_get_defaults(netlink_config_t *cfg);

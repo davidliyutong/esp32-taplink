@@ -7,6 +7,7 @@
 #include "esp_netif_net_stack.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
+#include "freertos/semphr.h"
 #include "lwip/etharp.h"
 #include "lwip/tcpip.h"
 #include <string.h>
@@ -146,6 +147,34 @@ typedef struct {
     uint8_t mac[6];
 } client_entry_t;
 
+typedef struct {
+    client_entry_t *out;
+    int max_clients;
+    struct netif *br_lwip;
+    uint32_t self_ip;
+    int count;
+    SemaphoreHandle_t done;
+} arp_enum_ctx_t;
+
+static void arp_enum_fn(void *arg)
+{
+    arp_enum_ctx_t *ctx = (arp_enum_ctx_t *)arg;
+    ctx->count = 0;
+    for (size_t i = 0; i < ARP_TABLE_SIZE && ctx->count < ctx->max_clients; i++) {
+        ip4_addr_t *ip = NULL;
+        struct netif *netif = NULL;
+        struct eth_addr *mac = NULL;
+        if (etharp_get_entry(i, &ip, &netif, &mac)) {
+            if (netif == ctx->br_lwip && ip->addr != ctx->self_ip) {
+                ctx->out[ctx->count].ip = ip->addr;
+                memcpy(ctx->out[ctx->count].mac, mac->addr, 6);
+                ctx->count++;
+            }
+        }
+    }
+    xSemaphoreGive(ctx->done);
+}
+
 static int get_clients(client_entry_t *out, int max_clients)
 {
     esp_netif_t *br = bridge_get_netif();
@@ -157,22 +186,21 @@ static int get_clients(client_entry_t *out, int max_clients)
     esp_netif_ip_info_t ip_info;
     esp_netif_get_ip_info(br, &ip_info);
 
-    int count = 0;
-    LOCK_TCPIP_CORE();
-    for (size_t i = 0; i < ARP_TABLE_SIZE && count < max_clients; i++) {
-        ip4_addr_t *ip = NULL;
-        struct netif *netif = NULL;
-        struct eth_addr *mac = NULL;
-        if (etharp_get_entry(i, &ip, &netif, &mac)) {
-            if (netif == br_lwip && ip->addr != ip_info.ip.addr) {
-                out[count].ip = ip->addr;
-                memcpy(out[count].mac, mac->addr, 6);
-                count++;
-            }
-        }
+    arp_enum_ctx_t ctx = {
+        .out = out,
+        .max_clients = max_clients,
+        .br_lwip = br_lwip,
+        .self_ip = ip_info.ip.addr,
+        .count = 0,
+        .done = xSemaphoreCreateBinary(),
+    };
+    if (!ctx.done) return 0;
+
+    if (tcpip_callback(arp_enum_fn, &ctx) == ERR_OK) {
+        xSemaphoreTake(ctx.done, portMAX_DELAY);
     }
-    UNLOCK_TCPIP_CORE();
-    return count;
+    vSemaphoreDelete(ctx.done);
+    return ctx.count;
 }
 
 /* ---- GET / (dashboard) ---- */
@@ -191,13 +219,16 @@ static esp_err_t dashboard_handler(httpd_req_t *req)
         "%s<div class='card'><h1>ESP32-NetLink</h1>"
         "<h2>Connected Devices</h2>",
         HTML_HEADER);
+    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
 
     if (client_count == 0) {
         pos += snprintf(page + pos, sizeof(page) - pos,
             "<p class='empty'>No devices connected</p>");
+        if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
     } else {
         pos += snprintf(page + pos, sizeof(page) - pos,
             "<table><tr><th>IP Address</th><th>MAC Address</th></tr>");
+        if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
         for (int i = 0; i < client_count && pos < (int)sizeof(page) - 128; i++) {
             uint8_t *ip = (uint8_t *)&clients[i].ip;
             uint8_t *m = clients[i].mac;
@@ -206,8 +237,10 @@ static esp_err_t dashboard_handler(httpd_req_t *req)
                 "<td>%02x:%02x:%02x:%02x:%02x:%02x</td></tr>",
                 ip[0], ip[1], ip[2], ip[3],
                 m[0], m[1], m[2], m[3], m[4], m[5]);
+            if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
         }
         pos += snprintf(page + pos, sizeof(page) - pos, "</table>");
+        if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
     }
 
     pos += snprintf(page + pos, sizeof(page) - pos,
@@ -217,6 +250,7 @@ static esp_err_t dashboard_handler(httpd_req_t *req)
         "Settings</a>"
         "%s",
         HTML_FOOTER);
+    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, page, pos);
@@ -233,10 +267,14 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     char ip_str[16];
     snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d", sn[0], sn[1], sn[2], sn[3]);
 
-    char page[4096];
+    char page[5120];
     int pos = 0;
+    int8_t txp = s_cfg->wifi_tx_power;
+    uint8_t ch = s_cfg->wifi_channel;
 
+#define SEL(val) ((txp == (val)) ? " selected" : "")
     pos += snprintf(page + pos, sizeof(page) - pos, "%s<div class='card'>", HTML_HEADER);
+    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
     pos += snprintf(page + pos, sizeof(page) - pos,
         "<h1>ESP32-NetLink Settings</h1>"
         "<form method='POST' action='/config'>"
@@ -245,6 +283,37 @@ static esp_err_t config_get_handler(httpd_req_t *req)
         "<label>WiFi Password</label>"
         "<input type='password' name='wifi_pass' value='%s' maxlength='64'>",
         s_cfg->wifi_ssid, s_cfg->wifi_password);
+    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
+    pos += snprintf(page + pos, sizeof(page) - pos,
+        "<label>WiFi TX Power</label>"
+        "<select name='wifi_txp' style='width:100%%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:1em'>"
+        "<option value='80'%s>20 dBm (max)</option>"
+        "<option value='68'%s>17 dBm</option>"
+        "<option value='60'%s>15 dBm</option>"
+        "<option value='44'%s>11 dBm</option>"
+        "<option value='34'%s>8.5 dBm</option>"
+        "<option value='20'%s>5 dBm</option>"
+        "<option value='8'%s>2 dBm (min)</option>"
+        "</select>",
+        SEL(80), SEL(68), SEL(60), SEL(44), SEL(34), SEL(20), SEL(8));
+#undef SEL
+    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
+
+#define CHSEL(v) ((ch == (v)) ? " selected" : "")
+    pos += snprintf(page + pos, sizeof(page) - pos,
+        "<label>WiFi Channel</label>"
+        "<select name='wifi_ch' style='width:100%%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:1em'>"
+        "<option value='0'%s>Auto</option>", CHSEL(0));
+    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
+    for (int i = 1; i <= 13; i++) {
+        pos += snprintf(page + pos, sizeof(page) - pos,
+            "<option value='%d'%s>%d</option>", i, CHSEL(i), i);
+        if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
+    }
+    pos += snprintf(page + pos, sizeof(page) - pos, "</select>");
+#undef CHSEL
+    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
+
     pos += snprintf(page + pos, sizeof(page) - pos,
         "<label>DHCP Subnet (e.g. 192.168.4.0/24)</label>"
         "<input type='text' name='dhcp_subnet' value='%s/%d' required>"
@@ -257,6 +326,7 @@ static esp_err_t config_get_handler(httpd_req_t *req)
         ip_str, s_cfg->dhcp_prefix_len,
         s_cfg->dhcp_gw_enabled ? " checked" : "",
         s_cfg->dhcp_dns_enabled ? " checked" : "");
+    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
     pos += snprintf(page + pos, sizeof(page) - pos,
         "<label>Admin Password</label>"
         "<input type='password' name='admin_pass' value='%s' maxlength='64' required>"
@@ -266,11 +336,10 @@ static esp_err_t config_get_handler(httpd_req_t *req)
         "padding:10px 24px;border-radius:4px;text-decoration:none;font-size:1em;margin-top:16px'>"
         "Back to Dashboard</a>%s",
         s_cfg->admin_password, HTML_FOOTER);
-
-    int len = pos < (int)sizeof(page) ? pos : (int)sizeof(page) - 1;
+    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
 
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, page, len);
+    httpd_resp_send(req, page, pos);
     return ESP_OK;
 }
 
@@ -320,6 +389,16 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 
     char dns_val[4];
     new_cfg.dhcp_dns_enabled = get_form_value(body, "dhcp_dns", dns_val, sizeof(dns_val)) ? 1 : 0;
+
+    char txp_val[8];
+    if (get_form_value(body, "wifi_txp", txp_val, sizeof(txp_val))) {
+        new_cfg.wifi_tx_power = (int8_t)atoi(txp_val);
+    }
+
+    char ch_val[4];
+    if (get_form_value(body, "wifi_ch", ch_val, sizeof(ch_val))) {
+        new_cfg.wifi_channel = (uint8_t)atoi(ch_val);
+    }
 
     if (strlen(new_cfg.wifi_ssid) == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "SSID cannot be empty");

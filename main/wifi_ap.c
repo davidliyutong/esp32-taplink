@@ -23,9 +23,12 @@ esp_err_t wifi_ap_start(const netlink_config_t *cfg)
 {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
 
+    uint8_t channel = cfg->wifi_channel;
+    if (channel == 0 || channel > 13) channel = 1;
+
     wifi_config_t wifi_config = {
         .ap = {
-            .channel = 1,
+            .channel = channel,
             .max_connection = 4,
             .authmode = WIFI_AUTH_WPA2_PSK,
             .pmf_cfg = {
@@ -47,6 +50,12 @@ esp_err_t wifi_ap_start(const netlink_config_t *cfg)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "WiFi AP started: SSID=%s", cfg->wifi_ssid);
+    int8_t tx_power = cfg->wifi_tx_power;
+    if (tx_power < 8) tx_power = 8;
+    if (tx_power > 80) tx_power = 80;
+    esp_wifi_set_max_tx_power(tx_power);
+
+    ESP_LOGI(TAG, "WiFi AP started: SSID=%s ch=%d tx=%.1fdBm",
+             cfg->wifi_ssid, channel, tx_power * 0.25f);
     return ESP_OK;
 }

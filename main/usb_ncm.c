@@ -71,6 +71,10 @@ bool usb_ncm_is_connected(void)
 
 static void usb_ncm_init_cb(void *ctx)
 {
+    if (s_connected) {
+        ESP_LOGI(TAG, "USB NCM re-enumerated by host");
+        return;
+    }
     s_connected = true;
     ESP_LOGI(TAG, "USB NCM initialized by host");
     void *handle = &s_driver;
