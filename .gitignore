@@ -1,0 +1,29 @@
+# ESP-IDF local install
+.esp-idf/
+.espressif/
+managed_components/
+
+# Build artifacts
+build/
+build-*/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Coverage
+*.gcda
+*.gcno
+*.info
+coverage/

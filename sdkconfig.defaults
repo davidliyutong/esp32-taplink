@@ -1,0 +1,39 @@
+# ================================================================
+# sdkconfig.defaults — esp32-netlink
+# ================================================================
+
+# -------- C++ --------
+CONFIG_COMPILER_CXX_EXCEPTIONS=n
+CONFIG_COMPILER_CXX_RTTI=n
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# -------- FreeRTOS --------
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y
+
+# -------- Task watchdog --------
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+CONFIG_ESP_TASK_WDT_EN=y
+
+# -------- Logging --------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+CONFIG_LOG_TIMESTAMP_SOURCE_RTOS=y
+
+# -------- Console (free USB pins for TinyUSB) --------
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# -------- USB / TinyUSB --------
+CONFIG_TINYUSB_NET_MODE_NCM=y
+CONFIG_TINYUSB_TASK_STACK_SIZE=4096
+
+# -------- WiFi --------
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+
+# -------- Network Bridge --------
+CONFIG_ESP_NETIF_BRIDGE_EN=y
+
+# -------- LWIP --------
+CONFIG_LWIP_IP4_FRAG=y
+CONFIG_LWIP_IP6_FRAG=y
+CONFIG_LWIP_NUM_NETIF_CLIENT_DATA=1

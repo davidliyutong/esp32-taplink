@@ -1,0 +1,39 @@
+name: build-firmware
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/esp-idf:v5.5.3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          idf.py set-target esp32s3
+          idf.py build
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp build/esp32-netlink.bin dist/
+          tar czf dist/esp32-netlink.tar.gz \
+              -C build esp32-netlink.bin esp32-netlink.elf
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: esp32-netlink
+          path: dist/esp32-netlink.*
+          retention-days: 30
