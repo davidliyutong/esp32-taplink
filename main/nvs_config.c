@@ -14,12 +14,25 @@ void config_get_defaults(netlink_config_t *cfg)
     strcpy(cfg->wifi_ssid, "ESP32-NetLink");
     strcpy(cfg->wifi_password, "12345678");
     strcpy(cfg->admin_password, "admin");
-    cfg->dhcp_subnet = inet_addr("192.168.4.0");
-    cfg->dhcp_prefix_len = 24;
+    cfg->usb_subnet = inet_addr("192.168.5.0");
+    cfg->usb_prefix_len = 24;
+    cfg->wifi_subnet = inet_addr("192.168.4.0");
+    cfg->wifi_prefix_len = 24;
     cfg->dhcp_gw_enabled = 1;
     cfg->dhcp_dns_enabled = 0;
     cfg->wifi_tx_power = 80;
     cfg->wifi_channel = 0;
+}
+
+static uint8_t sanitize_prefix(uint8_t prefix_len)
+{
+    return (prefix_len >= 8 && prefix_len <= 29) ? prefix_len : 24;
+}
+
+static uint32_t normalize_subnet(uint32_t subnet, uint8_t prefix_len)
+{
+    uint32_t mask = 0xFFFFFFFFUL << (32 - prefix_len);
+    return htonl(ntohl(subnet) & mask);
 }
 
 esp_err_t config_load(netlink_config_t *cfg)
@@ -45,8 +58,16 @@ esp_err_t config_load(netlink_config_t *cfg)
     len = sizeof(cfg->admin_password);
     nvs_get_str(handle, "admin_pass", cfg->admin_password, &len);
 
-    nvs_get_u32(handle, "dhcp_ip", &cfg->dhcp_subnet);
-    nvs_get_u8(handle, "dhcp_pfx", &cfg->dhcp_prefix_len);
+    nvs_get_u32(handle, "usb_ip", &cfg->usb_subnet);
+    nvs_get_u8(handle, "usb_pfx", &cfg->usb_prefix_len);
+
+    if (nvs_get_u32(handle, "wifi_ip", &cfg->wifi_subnet) != ESP_OK) {
+        nvs_get_u32(handle, "dhcp_ip", &cfg->wifi_subnet);
+    }
+    if (nvs_get_u8(handle, "wifi_pfx", &cfg->wifi_prefix_len) != ESP_OK) {
+        nvs_get_u8(handle, "dhcp_pfx", &cfg->wifi_prefix_len);
+    }
+
     nvs_get_u8(handle, "dhcp_gw", &cfg->dhcp_gw_enabled);
     nvs_get_u8(handle, "dhcp_dns", &cfg->dhcp_dns_enabled);
     nvs_get_i8(handle, "wifi_txp", &cfg->wifi_tx_power);
@@ -54,9 +75,17 @@ esp_err_t config_load(netlink_config_t *cfg)
 
     nvs_close(handle);
 
-    uint8_t *ip = (uint8_t *)&cfg->dhcp_subnet;
-    ESP_LOGI(TAG, "Config loaded: SSID=%s subnet=%d.%d.%d.%d/%d",
-             cfg->wifi_ssid, ip[0], ip[1], ip[2], ip[3], cfg->dhcp_prefix_len);
+    cfg->usb_prefix_len = sanitize_prefix(cfg->usb_prefix_len);
+    cfg->wifi_prefix_len = sanitize_prefix(cfg->wifi_prefix_len);
+    cfg->usb_subnet = normalize_subnet(cfg->usb_subnet, cfg->usb_prefix_len);
+    cfg->wifi_subnet = normalize_subnet(cfg->wifi_subnet, cfg->wifi_prefix_len);
+
+    uint8_t *usb = (uint8_t *)&cfg->usb_subnet;
+    uint8_t *wifi = (uint8_t *)&cfg->wifi_subnet;
+    ESP_LOGI(TAG, "Config loaded: SSID=%s usb=%d.%d.%d.%d/%d wifi=%d.%d.%d.%d/%d",
+             cfg->wifi_ssid,
+             usb[0], usb[1], usb[2], usb[3], cfg->usb_prefix_len,
+             wifi[0], wifi[1], wifi[2], wifi[3], cfg->wifi_prefix_len);
     return ESP_OK;
 }
 
@@ -69,8 +98,12 @@ esp_err_t config_save(const netlink_config_t *cfg)
     nvs_set_str(handle, "wifi_ssid", cfg->wifi_ssid);
     nvs_set_str(handle, "wifi_pass", cfg->wifi_password);
     nvs_set_str(handle, "admin_pass", cfg->admin_password);
-    nvs_set_u32(handle, "dhcp_ip", cfg->dhcp_subnet);
-    nvs_set_u8(handle, "dhcp_pfx", cfg->dhcp_prefix_len);
+    nvs_set_u32(handle, "usb_ip", cfg->usb_subnet);
+    nvs_set_u8(handle, "usb_pfx", cfg->usb_prefix_len);
+    nvs_set_u32(handle, "wifi_ip", cfg->wifi_subnet);
+    nvs_set_u8(handle, "wifi_pfx", cfg->wifi_prefix_len);
+    nvs_set_u32(handle, "dhcp_ip", cfg->wifi_subnet);
+    nvs_set_u8(handle, "dhcp_pfx", cfg->wifi_prefix_len);
     nvs_set_u8(handle, "dhcp_gw", cfg->dhcp_gw_enabled);
     nvs_set_u8(handle, "dhcp_dns", cfg->dhcp_dns_enabled);
     nvs_set_i8(handle, "wifi_txp", cfg->wifi_tx_power);

@@ -7,8 +7,10 @@ typedef struct {
     char wifi_ssid[33];
     char wifi_password[65];
     char admin_password[65];
-    uint32_t dhcp_subnet;
-    uint8_t dhcp_prefix_len;
+    uint32_t usb_subnet;
+    uint8_t usb_prefix_len;
+    uint32_t wifi_subnet;
+    uint8_t wifi_prefix_len;
     uint8_t dhcp_gw_enabled;
     uint8_t dhcp_dns_enabled;
     int8_t wifi_tx_power;

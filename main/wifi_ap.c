@@ -1,4 +1,5 @@
 #include "wifi_ap.h"
+#include "router.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_mac.h"
@@ -68,17 +69,24 @@ int wifi_ap_get_sta_count(void)
     return s_sta_count;
 }
 
-esp_netif_t *wifi_ap_create(void)
+esp_netif_t *wifi_ap_create(const netlink_config_t *cfg)
 {
     esp_netif_inherent_config_t wifi_cfg = ESP_NETIF_INHERENT_DEFAULT_WIFI_AP();
-    wifi_cfg.flags = ESP_NETIF_FLAG_AUTOUP;
-    wifi_cfg.ip_info = NULL;
+    esp_netif_ip_info_t ip_info;
+    router_make_ip_info(cfg->wifi_subnet, cfg->wifi_prefix_len,
+                        cfg->dhcp_gw_enabled, &ip_info);
+    wifi_cfg.ip_info = &ip_info;
 
     esp_netif_t *netif = esp_netif_create_wifi(WIFI_IF_AP, &wifi_cfg);
     assert(netif);
     esp_wifi_set_default_wifi_ap_handlers();
+    ESP_ERROR_CHECK(router_configure_dhcps(netif, cfg->wifi_subnet,
+                                           cfg->wifi_prefix_len,
+                                           cfg->dhcp_gw_enabled,
+                                           cfg->dhcp_dns_enabled,
+                                           "WiFi AP"));
 
-    ESP_LOGI(TAG, "WiFi AP netif created (bridge mode)");
+    ESP_LOGI(TAG, "WiFi AP netif created (router mode)");
     return netif;
 }
 

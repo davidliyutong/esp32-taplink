@@ -1,5 +1,5 @@
 #include "web_server.h"
-#include "bridge.h"
+#include "router.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -145,13 +145,16 @@ static const char HTML_FOOTER[] = "</body></html>";
 typedef struct {
     uint32_t ip;
     uint8_t mac[6];
+    const char *iface;
 } client_entry_t;
 
 typedef struct {
     client_entry_t *out;
     int max_clients;
-    struct netif *br_lwip;
-    uint32_t self_ip;
+    struct netif *usb_lwip;
+    struct netif *wifi_lwip;
+    uint32_t usb_self_ip;
+    uint32_t wifi_self_ip;
     int count;
     SemaphoreHandle_t done;
 } arp_enum_ctx_t;
@@ -165,8 +168,15 @@ static void arp_enum_fn(void *arg)
         struct netif *netif = NULL;
         struct eth_addr *mac = NULL;
         if (etharp_get_entry(i, &ip, &netif, &mac)) {
-            if (netif == ctx->br_lwip && ip->addr != ctx->self_ip) {
+            const char *iface = NULL;
+            if (netif == ctx->usb_lwip && ip->addr != ctx->usb_self_ip) {
+                iface = "USB";
+            } else if (netif == ctx->wifi_lwip && ip->addr != ctx->wifi_self_ip) {
+                iface = "WiFi";
+            }
+            if (iface) {
                 ctx->out[ctx->count].ip = ip->addr;
+                ctx->out[ctx->count].iface = iface;
                 memcpy(ctx->out[ctx->count].mac, mac->addr, 6);
                 ctx->count++;
             }
@@ -177,20 +187,26 @@ static void arp_enum_fn(void *arg)
 
 static int get_clients(client_entry_t *out, int max_clients)
 {
-    esp_netif_t *br = bridge_get_netif();
-    if (!br) return 0;
+    esp_netif_t *usb = router_get_usb_netif();
+    esp_netif_t *wifi = router_get_wifi_netif();
+    if (!usb && !wifi) return 0;
 
-    struct netif *br_lwip = esp_netif_get_netif_impl(br);
-    if (!br_lwip) return 0;
+    struct netif *usb_lwip = usb ? esp_netif_get_netif_impl(usb) : NULL;
+    struct netif *wifi_lwip = wifi ? esp_netif_get_netif_impl(wifi) : NULL;
+    if (!usb_lwip && !wifi_lwip) return 0;
 
-    esp_netif_ip_info_t ip_info;
-    esp_netif_get_ip_info(br, &ip_info);
+    esp_netif_ip_info_t usb_ip = {0};
+    esp_netif_ip_info_t wifi_ip = {0};
+    if (usb) esp_netif_get_ip_info(usb, &usb_ip);
+    if (wifi) esp_netif_get_ip_info(wifi, &wifi_ip);
 
     arp_enum_ctx_t ctx = {
         .out = out,
         .max_clients = max_clients,
-        .br_lwip = br_lwip,
-        .self_ip = ip_info.ip.addr,
+        .usb_lwip = usb_lwip,
+        .wifi_lwip = wifi_lwip,
+        .usb_self_ip = usb_ip.ip.addr,
+        .wifi_self_ip = wifi_ip.ip.addr,
         .count = 0,
         .done = xSemaphoreCreateBinary(),
     };
@@ -201,6 +217,32 @@ static int get_clients(client_entry_t *out, int max_clients)
     }
     vSemaphoreDelete(ctx.done);
     return ctx.count;
+}
+
+static void format_ipv4(uint32_t addr, char *out, size_t out_len)
+{
+    uint8_t *ip = (uint8_t *)&addr;
+    snprintf(out, out_len, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+}
+
+static void parse_subnet_field(const char *body, const char *key,
+                               uint32_t *subnet, uint8_t *prefix_len)
+{
+    char subnet_str[32];
+    if (!get_form_value(body, key, subnet_str, sizeof(subnet_str))) return;
+
+    char *slash = strchr(subnet_str, '/');
+    if (!slash) return;
+
+    *slash = '\0';
+    in_addr_t addr = inet_addr(subnet_str);
+    if (addr == INADDR_NONE) return;
+
+    int pfx = atoi(slash + 1);
+    if (pfx < 8 || pfx > 29) return;
+
+    *subnet = addr & router_prefix_to_netmask((uint8_t)pfx);
+    *prefix_len = (uint8_t)pfx;
 }
 
 /* ---- GET / (dashboard) ---- */
@@ -227,14 +269,15 @@ static esp_err_t dashboard_handler(httpd_req_t *req)
         if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
     } else {
         pos += snprintf(page + pos, sizeof(page) - pos,
-            "<table><tr><th>IP Address</th><th>MAC Address</th></tr>");
+            "<table><tr><th>Interface</th><th>IP Address</th><th>MAC Address</th></tr>");
         if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
         for (int i = 0; i < client_count && pos < (int)sizeof(page) - 128; i++) {
             uint8_t *ip = (uint8_t *)&clients[i].ip;
             uint8_t *m = clients[i].mac;
             pos += snprintf(page + pos, sizeof(page) - pos,
-                "<tr><td>%d.%d.%d.%d</td>"
+                "<tr><td>%s</td><td>%d.%d.%d.%d</td>"
                 "<td>%02x:%02x:%02x:%02x:%02x:%02x</td></tr>",
+                clients[i].iface,
                 ip[0], ip[1], ip[2], ip[3],
                 m[0], m[1], m[2], m[3], m[4], m[5]);
             if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
@@ -263,11 +306,12 @@ static esp_err_t config_get_handler(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_auth_required(req);
 
-    uint8_t *sn = (uint8_t *)&s_cfg->dhcp_subnet;
-    char ip_str[16];
-    snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d", sn[0], sn[1], sn[2], sn[3]);
+    char usb_ip_str[16];
+    char wifi_ip_str[16];
+    format_ipv4(s_cfg->usb_subnet, usb_ip_str, sizeof(usb_ip_str));
+    format_ipv4(s_cfg->wifi_subnet, wifi_ip_str, sizeof(wifi_ip_str));
 
-    char page[5120];
+    char page[6144];
     int pos = 0;
     int8_t txp = s_cfg->wifi_tx_power;
     uint8_t ch = s_cfg->wifi_channel;
@@ -315,15 +359,18 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
 
     pos += snprintf(page + pos, sizeof(page) - pos,
-        "<label>DHCP Subnet (e.g. 192.168.4.0/24)</label>"
-        "<input type='text' name='dhcp_subnet' value='%s/%d' required>"
+        "<label>USB Subnet (e.g. 192.168.5.0/24)</label>"
+        "<input type='text' name='usb_subnet' value='%s/%d' required>"
+        "<label>WiFi Subnet (e.g. 192.168.4.0/24)</label>"
+        "<input type='text' name='wifi_subnet' value='%s/%d' required>"
         "<div class='toggle'>"
         "<input type='checkbox' name='dhcp_gw' id='dhcp_gw' value='1'%s>"
         "<label for='dhcp_gw' style='margin:0'>Advertise gateway in DHCP</label></div>"
         "<div class='toggle'>"
         "<input type='checkbox' name='dhcp_dns' id='dhcp_dns' value='1'%s>"
         "<label for='dhcp_dns' style='margin:0'>Advertise DNS in DHCP</label></div>",
-        ip_str, s_cfg->dhcp_prefix_len,
+        usb_ip_str, s_cfg->usb_prefix_len,
+        wifi_ip_str, s_cfg->wifi_prefix_len,
         s_cfg->dhcp_gw_enabled ? " checked" : "",
         s_cfg->dhcp_dns_enabled ? " checked" : "");
     if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
@@ -368,21 +415,8 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     get_form_value(body, "wifi_pass", new_cfg.wifi_password, sizeof(new_cfg.wifi_password));
     get_form_value(body, "admin_pass", new_cfg.admin_password, sizeof(new_cfg.admin_password));
 
-    char subnet_str[32];
-    if (get_form_value(body, "dhcp_subnet", subnet_str, sizeof(subnet_str))) {
-        char *slash = strchr(subnet_str, '/');
-        if (slash) {
-            *slash = '\0';
-            in_addr_t addr = inet_addr(subnet_str);
-            if (addr != INADDR_NONE) {
-                new_cfg.dhcp_subnet = addr;
-                int pfx = atoi(slash + 1);
-                if (pfx >= 8 && pfx <= 30) {
-                    new_cfg.dhcp_prefix_len = (uint8_t)pfx;
-                }
-            }
-        }
-    }
+    parse_subnet_field(body, "usb_subnet", &new_cfg.usb_subnet, &new_cfg.usb_prefix_len);
+    parse_subnet_field(body, "wifi_subnet", &new_cfg.wifi_subnet, &new_cfg.wifi_prefix_len);
 
     char gw_val[4];
     new_cfg.dhcp_gw_enabled = get_form_value(body, "dhcp_gw", gw_val, sizeof(gw_val)) ? 1 : 0;

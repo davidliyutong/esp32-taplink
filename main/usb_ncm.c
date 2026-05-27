@@ -1,4 +1,5 @@
 #include "usb_ncm.h"
+#include "router.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tinyusb_net.h"
@@ -108,7 +109,7 @@ static esp_err_t usb_ncm_post_attach(esp_netif_t *esp_netif, void *args)
     return ESP_OK;
 }
 
-esp_netif_t *usb_ncm_netif_create(void)
+esp_netif_t *usb_ncm_netif_create(const netlink_config_t *cfg)
 {
     uint8_t base_mac[6];
     esp_efuse_mac_get_default(base_mac);
@@ -117,10 +118,14 @@ esp_netif_t *usb_ncm_netif_create(void)
     s_driver.mac_addr[0] |= 0x02;
     s_driver.mac_addr[0] &= ~0x01;
 
+    esp_netif_ip_info_t ip_info;
+    router_make_ip_info(cfg->usb_subnet, cfg->usb_prefix_len,
+                        cfg->dhcp_gw_enabled, &ip_info);
+
     esp_netif_inherent_config_t base_cfg = {
-        .flags = 0,
+        .flags = ESP_NETIF_DHCP_SERVER,
         .mac = {0},
-        .ip_info = NULL,
+        .ip_info = &ip_info,
         .get_ip_event = 0,
         .lost_ip_event = 0,
         .if_key = "USB_NCM",
@@ -140,6 +145,11 @@ esp_netif_t *usb_ncm_netif_create(void)
 
     s_driver.base.post_attach = usb_ncm_post_attach;
     ESP_ERROR_CHECK(esp_netif_attach(netif, &s_driver));
+    ESP_ERROR_CHECK(router_configure_dhcps(netif, cfg->usb_subnet,
+                                           cfg->usb_prefix_len,
+                                           cfg->dhcp_gw_enabled,
+                                           cfg->dhcp_dns_enabled,
+                                           "USB NCM"));
 
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
                                                 usb_ncm_port_event_handler, NULL));
