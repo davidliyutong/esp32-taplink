@@ -1,28 +1,48 @@
-#include <stdio.h>
+#include "driver/gpio.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_pm.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
-#include "esp_event.h"
-#include "esp_wifi.h"
-#include "esp_system.h"
 #include "nvs_flash.h"
-#include "driver/gpio.h"
+#include "sdkconfig.h"
+#include <stdio.h>
 
 #include "nvs_config.h"
-#include "usb_ncm.h"
-#include "wifi_ap.h"
-#include "router.h"
 #include "port_forward.h"
+#include "router.h"
+#include "usb_ncm.h"
 #include "web_server.h"
+#include "wifi_ap.h"
 
 static const char *TAG = "main";
 
-#define LED_GPIO      GPIO_NUM_21
-#define BUTTON_GPIO   GPIO_NUM_0
+#define LED_GPIO GPIO_NUM_21
+#define BUTTON_GPIO GPIO_NUM_0
 #define RESET_HOLD_MS 5000
+#define PM_MIN_FREQ_MHZ 80
 
 static netlink_config_t s_config;
 static volatile bool s_booting = true;
+
+static void configure_power_management(void)
+{
+#if CONFIG_PM_ENABLE
+    esp_pm_config_t pm_config = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = PM_MIN_FREQ_MHZ,
+        .light_sleep_enable = false,
+    };
+
+    ESP_ERROR_CHECK(esp_pm_configure(&pm_config));
+    ESP_LOGI(TAG, "Power management enabled: %d-%d MHz, light sleep off", PM_MIN_FREQ_MHZ,
+             CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
+#else
+    ESP_LOGW(TAG, "Power management disabled; idle CPU stays at fixed clock");
+#endif
+}
 
 static void led_button_task(void *arg)
 {
@@ -72,6 +92,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    configure_power_management();
 
     wifi_init_config_t wifi_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_cfg));

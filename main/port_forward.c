@@ -1,12 +1,13 @@
 #include "port_forward.h"
-#include "router.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "router.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,14 +15,18 @@
 
 static const char *TAG = "port_forward";
 
-enum {
+enum
+{
     PORT_FORWARD_TASK_STACK = 4096,
     PORT_FORWARD_TASK_PRIO = 4,
     PORT_FORWARD_SESSIONS_PER_RULE = 2,
+    PORT_FORWARD_CONNECT_TIMEOUT_SEC = 10,
+    PORT_FORWARD_IO_TIMEOUT_SEC = 30,
     PORT_FORWARD_IDLE_TIMEOUT_SEC = 1800,
 };
 
-typedef struct {
+typedef struct
+{
     port_forward_rule_t rule;
     uint32_t listen_ip;
     uint32_t wifi_subnet;
@@ -30,7 +35,8 @@ typedef struct {
     uint8_t index;
 } port_forward_listener_t;
 
-typedef struct {
+typedef struct
+{
     port_forward_listener_t *listener;
     int client_fd;
 } port_forward_session_t;
@@ -49,6 +55,74 @@ static void format_ipv4(uint32_t addr, char *out, size_t out_len)
 {
     uint8_t *ip = (uint8_t *)&addr;
     snprintf(out, out_len, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+}
+
+static void set_socket_timeouts(int fd)
+{
+    struct timeval timeout = {
+        .tv_sec = PORT_FORWARD_IO_TIMEOUT_SEC,
+        .tv_usec = 0,
+    };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+static bool restore_socket_flags(int fd, int flags)
+{
+    return fcntl(fd, F_SETFL, flags) == 0;
+}
+
+static bool connect_with_timeout(int fd, const struct sockaddr *addr, socklen_t addr_len, int timeout_sec)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return connect(fd, addr, addr_len) == 0;
+    }
+
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        return connect(fd, addr, addr_len) == 0;
+    }
+
+    int rc = connect(fd, addr, addr_len);
+    if (rc == 0) {
+        restore_socket_flags(fd, flags);
+        return true;
+    }
+    if (errno != EINPROGRESS) {
+        restore_socket_flags(fd, flags);
+        return false;
+    }
+
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(fd, &wfds);
+    struct timeval timeout = {
+        .tv_sec = timeout_sec,
+        .tv_usec = 0,
+    };
+
+    rc = select(fd + 1, NULL, &wfds, NULL, &timeout);
+    if (rc <= 0) {
+        restore_socket_flags(fd, flags);
+        if (rc == 0) {
+            errno = ETIMEDOUT;
+        }
+        return false;
+    }
+
+    int so_error = 0;
+    socklen_t so_error_len = sizeof(so_error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) != 0) {
+        restore_socket_flags(fd, flags);
+        return false;
+    }
+
+    restore_socket_flags(fd, flags);
+    if (so_error != 0) {
+        errno = so_error;
+        return false;
+    }
+    return true;
 }
 
 static bool send_all(int fd, const uint8_t *data, int len)
@@ -98,8 +172,10 @@ static void session_task(void *arg)
         ESP_LOGW(TAG, "rule %u: target socket failed: errno=%d", listener->index, errno);
         goto done;
     }
+    set_socket_timeouts(target_fd);
 
-    if (connect(target_fd, (struct sockaddr *)&target, sizeof(target)) != 0) {
+    if (!connect_with_timeout(target_fd, (struct sockaddr *)&target, sizeof(target),
+                              PORT_FORWARD_CONNECT_TIMEOUT_SEC)) {
         ESP_LOGW(TAG, "rule %u: connect target failed: errno=%d", listener->index, errno);
         goto done;
     }
@@ -166,9 +242,8 @@ static void listener_task(void *arg)
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
         char bind_ip[16];
         format_ipv4(addr.sin_addr.s_addr, bind_ip, sizeof(bind_ip));
-        ESP_LOGE(TAG, "rule %u: bind %s:%u failed: errno=%d",
-                 listener->index, bind_ip,
-                 listener->rule.listen_port, errno);
+        ESP_LOGE(TAG, "rule %u: bind %s:%u failed: errno=%d", listener->index, bind_ip, listener->rule.listen_port,
+                 errno);
         close(listen_fd);
         vTaskDelete(NULL);
         return;
@@ -185,9 +260,8 @@ static void listener_task(void *arg)
     char target_ip[16];
     format_ipv4(addr.sin_addr.s_addr, listen_ip, sizeof(listen_ip));
     format_ipv4(listener->rule.target_ip, target_ip, sizeof(target_ip));
-    ESP_LOGI(TAG, "rule %u: %s:%u -> %s:%u",
-             listener->index, listen_ip, listener->rule.listen_port,
-             target_ip, listener->rule.target_port);
+    ESP_LOGI(TAG, "rule %u: %s:%u -> %s:%u", listener->index, listen_ip, listener->rule.listen_port, target_ip,
+             listener->rule.target_port);
 
     while (true) {
         struct sockaddr_in peer = {0};
@@ -201,13 +275,10 @@ static void listener_task(void *arg)
             continue;
         }
 
-        if (!ip_in_subnet(peer.sin_addr.s_addr,
-                          listener->wifi_subnet,
-                          listener->wifi_prefix_len)) {
+        if (!ip_in_subnet(peer.sin_addr.s_addr, listener->wifi_subnet, listener->wifi_prefix_len)) {
             char peer_ip[16];
             format_ipv4(peer.sin_addr.s_addr, peer_ip, sizeof(peer_ip));
-            ESP_LOGW(TAG, "rule %u: reject non-WiFi peer %s",
-                     listener->index, peer_ip);
+            ESP_LOGW(TAG, "rule %u: reject non-WiFi peer %s", listener->index, peer_ip);
             close(client_fd);
             continue;
         }
@@ -217,6 +288,7 @@ static void listener_task(void *arg)
             close(client_fd);
             continue;
         }
+        set_socket_timeouts(client_fd);
 
         port_forward_session_t *session = calloc(1, sizeof(*session));
         if (!session) {
@@ -229,8 +301,8 @@ static void listener_task(void *arg)
 
         char task_name[16];
         snprintf(task_name, sizeof(task_name), "pf_sess_%u", listener->index);
-        if (xTaskCreate(session_task, task_name, PORT_FORWARD_TASK_STACK,
-                        session, PORT_FORWARD_TASK_PRIO, NULL) != pdPASS) {
+        if (xTaskCreate(session_task, task_name, PORT_FORWARD_TASK_STACK, session, PORT_FORWARD_TASK_PRIO, NULL) !=
+            pdPASS) {
             ESP_LOGE(TAG, "rule %u: session task create failed", listener->index);
             free(session);
             xSemaphoreGive(listener->session_slots);
@@ -247,8 +319,7 @@ static bool rule_is_valid(const netlink_config_t *cfg, const port_forward_rule_t
     if (rule->listen_port == 0 || rule->listen_port == 80 || rule->target_port == 0) {
         return false;
     }
-    if (rule->target_ip == 0 ||
-        !ip_in_subnet(rule->target_ip, cfg->usb_subnet, cfg->usb_prefix_len)) {
+    if (rule->target_ip == 0 || !ip_in_subnet(rule->target_ip, cfg->usb_subnet, cfg->usb_prefix_len)) {
         return false;
     }
     return true;
@@ -271,19 +342,17 @@ esp_err_t port_forward_start(const netlink_config_t *cfg)
 
         bool duplicate = false;
         for (int j = 0; j < i; j++) {
-            if (cfg->port_forwards[j].enabled &&
-                cfg->port_forwards[j].listen_port == rule->listen_port) {
+            if (cfg->port_forwards[j].enabled && cfg->port_forwards[j].listen_port == rule->listen_port) {
                 duplicate = true;
                 break;
             }
         }
         if (duplicate) {
-            ESP_LOGW(TAG, "rule %d skipped: duplicate listen port %u",
-                     i, rule->listen_port);
+            ESP_LOGW(TAG, "rule %d skipped: duplicate listen port %u", i, rule->listen_port);
             continue;
         }
 
-        s_listeners[i] = (port_forward_listener_t) {
+        s_listeners[i] = (port_forward_listener_t){
             .rule = *rule,
             .listen_ip = wifi_ip.ip.addr,
             .wifi_subnet = cfg->wifi_subnet,
@@ -291,8 +360,7 @@ esp_err_t port_forward_start(const netlink_config_t *cfg)
             .index = i,
         };
         s_listeners[i].session_slots =
-            xSemaphoreCreateCounting(PORT_FORWARD_SESSIONS_PER_RULE,
-                                     PORT_FORWARD_SESSIONS_PER_RULE);
+            xSemaphoreCreateCounting(PORT_FORWARD_SESSIONS_PER_RULE, PORT_FORWARD_SESSIONS_PER_RULE);
         if (!s_listeners[i].session_slots) {
             ESP_LOGE(TAG, "rule %d skipped: semaphore allocation failed", i);
             continue;
@@ -300,8 +368,7 @@ esp_err_t port_forward_start(const netlink_config_t *cfg)
 
         char task_name[16];
         snprintf(task_name, sizeof(task_name), "pf_listen_%d", i);
-        if (xTaskCreate(listener_task, task_name, PORT_FORWARD_TASK_STACK,
-                        &s_listeners[i], PORT_FORWARD_TASK_PRIO,
+        if (xTaskCreate(listener_task, task_name, PORT_FORWARD_TASK_STACK, &s_listeners[i], PORT_FORWARD_TASK_PRIO,
                         &s_listener_tasks[i]) != pdPASS) {
             ESP_LOGE(TAG, "rule %d skipped: listener task create failed", i);
             vSemaphoreDelete(s_listeners[i].session_slots);

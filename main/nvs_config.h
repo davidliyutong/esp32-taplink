@@ -5,14 +5,16 @@
 
 #define NETLINK_MAX_PORT_FORWARDS 4
 
-typedef struct {
+typedef struct
+{
     uint8_t enabled;
     uint16_t listen_port;
     uint32_t target_ip;
     uint16_t target_port;
 } port_forward_rule_t;
 
-typedef struct {
+typedef struct
+{
     char wifi_ssid[33];
     char wifi_password[65];
     char admin_password[65];

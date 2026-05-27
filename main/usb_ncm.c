@@ -1,18 +1,22 @@
 #include "usb_ncm.h"
+#include "esp_eth_com.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_mac.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "router.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tinyusb_net.h"
-#include "esp_log.h"
-#include "esp_mac.h"
-#include "esp_event.h"
-#include "esp_eth_com.h"
-#include <string.h>
+#include "tusb.h"
 #include <stdlib.h>
+#include <string.h>
 
 static const char *TAG = "usb_ncm";
 
-typedef struct {
+typedef struct
+{
     esp_netif_driver_base_t base;
     uint8_t netif_mac_addr[6];
     uint8_t usb_mac_addr[6];
@@ -65,13 +69,42 @@ static esp_err_t usb_ncm_recv_cb(void *buffer, uint16_t len, void *ctx)
     return ESP_OK;
 }
 
-uint32_t usb_ncm_get_rx_count(void) { return s_rx_count; }
-uint32_t usb_ncm_get_tx_count(void) { return s_tx_count; }
+uint32_t usb_ncm_get_rx_count(void)
+{
+    return s_rx_count;
+}
+uint32_t usb_ncm_get_tx_count(void)
+{
+    return s_tx_count;
+}
+
+void usb_ncm_prepare_restart(void)
+{
+    ESP_LOGI(TAG, "Disconnecting USB NCM before restart");
+
+    if (s_connected) {
+        s_connected = false;
+        void *handle = &s_driver;
+        esp_event_post(ETH_EVENT, ETHERNET_EVENT_DISCONNECTED, &handle, sizeof(handle), 0);
+    }
+
+    if (tud_inited()) {
+        tud_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(300));
+    }
+
+    tinyusb_net_deinit();
+    esp_err_t err = tinyusb_driver_uninstall();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "TinyUSB uninstall before restart failed: %s", esp_err_to_name(err));
+    }
+}
 
 static void usb_ncm_port_event_handler(void *arg, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     void *handle = *(void **)event_data;
-    if (handle != &s_driver) return;
+    if (handle != &s_driver)
+        return;
 
     switch (event_id) {
     case ETHERNET_EVENT_START:
@@ -111,7 +144,8 @@ static void usb_event_cb(tinyusb_event_t *event, void *arg)
 
 static void usb_ncm_post_start_once(void)
 {
-    if (s_started) return;
+    if (s_started)
+        return;
 
     s_started = true;
     void *handle = &s_driver;
@@ -120,7 +154,8 @@ static void usb_ncm_post_start_once(void)
 
 static void usb_ncm_post_connected_once(void)
 {
-    if (s_connected) return;
+    if (s_connected)
+        return;
 
     s_connected = true;
     void *handle = &s_driver;
@@ -175,8 +210,7 @@ esp_netif_t *usb_ncm_netif_create(const netlink_config_t *cfg)
     usb_ncm_make_local_mac(s_driver.usb_mac_addr, base_mac, 5);
 
     esp_netif_ip_info_t ip_info;
-    router_make_ip_info(cfg->usb_subnet, cfg->usb_prefix_len,
-                        cfg->dhcp_gw_enabled, &ip_info);
+    router_make_ip_info(cfg->usb_subnet, cfg->usb_prefix_len, cfg->dhcp_gw_enabled, &ip_info);
 
     esp_netif_inherent_config_t base_cfg = {
         .flags = ESP_NETIF_DHCP_SERVER | ESP_NETIF_FLAG_AUTOUP,
@@ -201,21 +235,17 @@ esp_netif_t *usb_ncm_netif_create(const netlink_config_t *cfg)
 
     s_driver.base.post_attach = usb_ncm_post_attach;
     ESP_ERROR_CHECK(esp_netif_attach(netif, &s_driver));
-    ESP_ERROR_CHECK(router_configure_dhcps(netif, cfg->usb_subnet,
-                                           cfg->usb_prefix_len,
-                                           cfg->dhcp_gw_enabled,
-                                           cfg->dhcp_dns_enabled,
-                                           "USB NCM"));
+    ESP_ERROR_CHECK(router_configure_dhcps(netif, cfg->usb_subnet, cfg->usb_prefix_len, cfg->dhcp_gw_enabled,
+                                           cfg->dhcp_dns_enabled, "USB NCM"));
 
-    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
-                                                usb_ncm_port_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, usb_ncm_port_event_handler, NULL));
 
-    ESP_LOGI(TAG, "USB NCM netif created, netif MAC=%02x:%02x:%02x:%02x:%02x:%02x usb MAC=%02x:%02x:%02x:%02x:%02x:%02x",
-             s_driver.netif_mac_addr[0], s_driver.netif_mac_addr[1],
-             s_driver.netif_mac_addr[2], s_driver.netif_mac_addr[3],
-             s_driver.netif_mac_addr[4], s_driver.netif_mac_addr[5],
-             s_driver.usb_mac_addr[0], s_driver.usb_mac_addr[1],
-             s_driver.usb_mac_addr[2], s_driver.usb_mac_addr[3],
+    ESP_LOGI(TAG,
+             "USB NCM netif created, netif MAC=%02x:%02x:%02x:%02x:%02x:%02x usb "
+             "MAC=%02x:%02x:%02x:%02x:%02x:%02x",
+             s_driver.netif_mac_addr[0], s_driver.netif_mac_addr[1], s_driver.netif_mac_addr[2],
+             s_driver.netif_mac_addr[3], s_driver.netif_mac_addr[4], s_driver.netif_mac_addr[5],
+             s_driver.usb_mac_addr[0], s_driver.usb_mac_addr[1], s_driver.usb_mac_addr[2], s_driver.usb_mac_addr[3],
              s_driver.usb_mac_addr[4], s_driver.usb_mac_addr[5]);
     return netif;
 }
