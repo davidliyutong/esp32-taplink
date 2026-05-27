@@ -3,8 +3,9 @@ idf_component_register(
          "nvs_config.c"
          "usb_ncm.c"
          "wifi_ap.c"
-         "bridge.c"
+         "router.c"
+         "port_forward.c"
          "web_server.c"
     INCLUDE_DIRS "."
-    PRIV_REQUIRES esp_wifi esp_netif nvs_flash esp_http_server esp_event esp_eth esp_timer lwip
+    PRIV_REQUIRES esp_wifi esp_netif nvs_flash esp_http_server esp_event esp_eth lwip
 )

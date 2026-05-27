@@ -11,7 +11,8 @@
 #include "nvs_config.h"
 #include "usb_ncm.h"
 #include "wifi_ap.h"
-#include "bridge.h"
+#include "router.h"
+#include "port_forward.h"
 #include "web_server.h"
 
 static const char *TAG = "main";
@@ -75,16 +76,15 @@ void app_main(void)
     wifi_init_config_t wifi_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_cfg));
 
-    esp_netif_t *usb_netif = usb_ncm_netif_create();
-    esp_netif_t *wifi_netif = wifi_ap_create();
-
-    esp_netif_t *br_netif = bridge_create(&s_config);
-    ESP_ERROR_CHECK(bridge_start(br_netif, usb_netif, wifi_netif));
+    esp_netif_t *usb_netif = usb_ncm_netif_create(&s_config);
+    esp_netif_t *wifi_netif = wifi_ap_create(&s_config);
+    ESP_ERROR_CHECK(router_start(usb_netif, wifi_netif, &s_config));
 
     ESP_ERROR_CHECK(web_server_start(&s_config));
     ESP_ERROR_CHECK(wifi_ap_start(&s_config));
     ESP_ERROR_CHECK(usb_ncm_start());
+    ESP_ERROR_CHECK(port_forward_start(&s_config));
 
     s_booting = false;
-    ESP_LOGI(TAG, "All systems up. Bridge ready.");
+    ESP_LOGI(TAG, "All systems up. Router ready.");
 }

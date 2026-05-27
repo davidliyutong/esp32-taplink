@@ -1,13 +1,9 @@
 #include "web_server.h"
-#include "bridge.h"
+#include "router.h"
 #include "usb_ncm.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_netif.h"
-#include "esp_netif_net_stack.h"
-#include "esp_event.h"
-#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
@@ -15,6 +11,7 @@
 #include "lwip/etharp.h"
 #include "lwip/tcpip.h"
 #include "lwip/netif.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -176,99 +173,98 @@ static const char HTML_HEADER[] =
 
 static const char HTML_FOOTER[] = "</body></html>";
 
-/* ---- DHCP client tracking ---- */
-
-typedef struct {
-    uint32_t ip;
-    uint8_t mac[6];
-} client_entry_t;
-
-#define MAX_DHCP_CLIENTS 10
-#define DHCP_CLIENT_TIMEOUT_US \
-    (((int64_t)BRIDGE_DHCP_LEASE_MINUTES + 5) * 60 * 1000000)
-
-typedef struct {
-    uint32_t ip;
-    uint8_t mac[6];
-    bool active;
-    int64_t last_seen_us;
-} dhcp_client_t;
-
-static dhcp_client_t s_dhcp_clients[MAX_DHCP_CLIENTS];
-static SemaphoreHandle_t s_dhcp_mutex;
-
-static void wifi_disconnect_handler(void *arg, esp_event_base_t base,
-                                     int32_t event_id, void *event_data)
+static esp_err_t send_chunkf(httpd_req_t *req, const char *fmt, ...)
 {
-    wifi_event_ap_stadisconnected_t *evt =
-        (wifi_event_ap_stadisconnected_t *)event_data;
-    if (!s_dhcp_mutex) return;
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    int len = vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
 
-    xSemaphoreTake(s_dhcp_mutex, portMAX_DELAY);
-    for (int i = 0; i < MAX_DHCP_CLIENTS; i++) {
-        if (s_dhcp_clients[i].active &&
-            memcmp(s_dhcp_clients[i].mac, evt->mac, 6) == 0) {
-            s_dhcp_clients[i].active = false;
-            break;
-        }
+    if (len < 0) {
+        return ESP_FAIL;
     }
-    xSemaphoreGive(s_dhcp_mutex);
+    if (len >= (int)sizeof(buf)) {
+        len = sizeof(buf) - 1;
+    }
+    return httpd_resp_send_chunk(req, buf, len);
 }
 
-static void dhcp_event_handler(void *arg, esp_event_base_t base,
-                                int32_t event_id, void *event_data)
+/* ---- Formatting and config helpers ---- */
+
+static void format_ipv4(uint32_t addr, char *out, size_t out_len)
 {
-    ip_event_ap_staipassigned_t *evt = (ip_event_ap_staipassigned_t *)event_data;
-    if (!s_dhcp_mutex) return;
-
-    xSemaphoreTake(s_dhcp_mutex, portMAX_DELAY);
-
-    int free_slot = -1;
-    for (int i = 0; i < MAX_DHCP_CLIENTS; i++) {
-        if (s_dhcp_clients[i].active &&
-            memcmp(s_dhcp_clients[i].mac, evt->mac, 6) == 0) {
-            s_dhcp_clients[i].ip = evt->ip.addr;
-            s_dhcp_clients[i].last_seen_us = esp_timer_get_time();
-            xSemaphoreGive(s_dhcp_mutex);
-            return;
-        }
-        if (!s_dhcp_clients[i].active && free_slot < 0)
-            free_slot = i;
-    }
-
-    if (free_slot >= 0) {
-        s_dhcp_clients[free_slot].ip = evt->ip.addr;
-        memcpy(s_dhcp_clients[free_slot].mac, evt->mac, 6);
-        s_dhcp_clients[free_slot].last_seen_us = esp_timer_get_time();
-        s_dhcp_clients[free_slot].active = true;
-    }
-
-    xSemaphoreGive(s_dhcp_mutex);
+    uint8_t *ip = (uint8_t *)&addr;
+    snprintf(out, out_len, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
 }
 
-static int get_clients(client_entry_t *out, int max_clients)
+static void format_duration(uint32_t seconds, char *out, size_t out_len)
 {
-    if (!s_dhcp_mutex) return 0;
+    uint32_t minutes = seconds / 60;
+    uint32_t hours = minutes / 60;
 
-    xSemaphoreTake(s_dhcp_mutex, portMAX_DELAY);
+    if (hours > 0) {
+        snprintf(out, out_len, "%uh %02um", (unsigned)hours,
+                 (unsigned)(minutes % 60));
+    } else if (minutes > 0) {
+        snprintf(out, out_len, "%um", (unsigned)minutes);
+    } else {
+        snprintf(out, out_len, "%us", (unsigned)seconds);
+    }
+}
 
-    int64_t now = esp_timer_get_time();
-    int count = 0;
+static bool parse_subnet_text(const char *subnet_str, uint32_t *subnet,
+                              uint8_t *prefix_len)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%s", subnet_str);
 
-    for (int i = 0; i < MAX_DHCP_CLIENTS && count < max_clients; i++) {
-        if (s_dhcp_clients[i].active) {
-            if (now - s_dhcp_clients[i].last_seen_us < DHCP_CLIENT_TIMEOUT_US) {
-                out[count].ip = s_dhcp_clients[i].ip;
-                memcpy(out[count].mac, s_dhcp_clients[i].mac, 6);
-                count++;
-            } else {
-                s_dhcp_clients[i].active = false;
-            }
-        }
+    char *slash = strchr(buf, '/');
+    if (!slash) {
+        return false;
     }
 
-    xSemaphoreGive(s_dhcp_mutex);
-    return count;
+    *slash = '\0';
+    in_addr_t addr = inet_addr(buf);
+    if (addr == INADDR_NONE) {
+        return false;
+    }
+
+    int pfx = atoi(slash + 1);
+    if (pfx < 8 || pfx > 29) {
+        return false;
+    }
+
+    *subnet = addr & router_prefix_to_netmask((uint8_t)pfx);
+    *prefix_len = (uint8_t)pfx;
+    return true;
+}
+
+static bool parse_subnet_field(const char *body, const char *key,
+                               uint32_t *subnet, uint8_t *prefix_len)
+{
+    char subnet_str[32];
+    if (!get_form_value(body, key, subnet_str, sizeof(subnet_str))) {
+        return false;
+    }
+    return parse_subnet_text(subnet_str, subnet, prefix_len);
+}
+
+static bool ip_in_subnet(uint32_t ip, uint32_t subnet, uint8_t prefix_len)
+{
+    uint32_t mask = router_prefix_to_netmask(prefix_len);
+    return (ip & mask) == (subnet & mask);
+}
+
+static bool parse_port_u16(const char *text, uint16_t *out)
+{
+    char *end = NULL;
+    long value = strtol(text, &end, 10);
+    if (!text[0] || (end && *end) || value < 1 || value > 65535) {
+        return false;
+    }
+    *out = (uint16_t)value;
+    return true;
 }
 
 /* ---- GET / (dashboard) ---- */
@@ -277,41 +273,42 @@ static esp_err_t dashboard_handler(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_auth_required(req);
 
-    client_entry_t clients[10];
-    int client_count = get_clients(clients, 10);
+    router_dhcp_lease_t leases[ROUTER_MAX_DHCP_LEASES];
+    size_t lease_count = router_get_dhcp_leases(leases, ROUTER_MAX_DHCP_LEASES);
 
-    char page[3072];
-    int pos = 0;
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send_chunk(req, HTML_HEADER, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req,
+        "<div class='card'><h1>ESP32-NetLink</h1>"
+        "<h2>DHCP Leases</h2>",
+        HTTPD_RESP_USE_STRLEN);
 
-    pos += snprintf(page + pos, sizeof(page) - pos,
-        "%s<div class='card'><h1>ESP32-NetLink</h1>"
-        "<h2>DHCP Clients</h2>",
-        HTML_HEADER);
-    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
-
-    if (client_count == 0) {
-        pos += snprintf(page + pos, sizeof(page) - pos,
-            "<p class='empty'>No devices connected</p>");
-        if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
+    if (lease_count == 0) {
+        httpd_resp_send_chunk(req,
+            "<p class='empty'>No devices connected</p>",
+            HTTPD_RESP_USE_STRLEN);
     } else {
-        pos += snprintf(page + pos, sizeof(page) - pos,
-            "<table><tr><th>IP Address</th><th>MAC Address</th></tr>");
-        if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
-        for (int i = 0; i < client_count && pos < (int)sizeof(page) - 128; i++) {
-            uint8_t *ip = (uint8_t *)&clients[i].ip;
-            uint8_t *m = clients[i].mac;
-            pos += snprintf(page + pos, sizeof(page) - pos,
-                "<tr><td>%d.%d.%d.%d</td>"
-                "<td>%02x:%02x:%02x:%02x:%02x:%02x</td></tr>",
+        httpd_resp_send_chunk(req,
+            "<table><tr><th>Interface</th><th>IP Address</th>"
+            "<th>MAC Address</th><th>Expires</th></tr>",
+            HTTPD_RESP_USE_STRLEN);
+        for (size_t i = 0; i < lease_count; i++) {
+            uint8_t *ip = (uint8_t *)&leases[i].ip;
+            uint8_t *m = leases[i].mac;
+            char expires[16];
+            format_duration(leases[i].expires_in_seconds, expires, sizeof(expires));
+            send_chunkf(req,
+                "<tr><td>%s</td><td>%d.%d.%d.%d</td>"
+                "<td>%02x:%02x:%02x:%02x:%02x:%02x</td><td>%s</td></tr>",
+                leases[i].iface,
                 ip[0], ip[1], ip[2], ip[3],
-                m[0], m[1], m[2], m[3], m[4], m[5]);
-            if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
+                m[0], m[1], m[2], m[3], m[4], m[5],
+                expires);
         }
-        pos += snprintf(page + pos, sizeof(page) - pos, "</table>");
-        if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
+        httpd_resp_send_chunk(req, "</table>", HTTPD_RESP_USE_STRLEN);
     }
 
-    pos += snprintf(page + pos, sizeof(page) - pos,
+    send_chunkf(req,
         "</div>"
         "<a href='/config' style='display:block;text-align:center;background:#2196F3;color:#fff;"
         "padding:10px 24px;border-radius:4px;text-decoration:none;font-size:1em;margin-top:16px'>"
@@ -321,10 +318,7 @@ static esp_err_t dashboard_handler(httpd_req_t *req)
         "Diagnostics</a>"
         "%s",
         HTML_FOOTER);
-    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
-
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, page, pos);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -334,19 +328,20 @@ static esp_err_t config_get_handler(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_auth_required(req);
 
-    uint8_t *sn = (uint8_t *)&s_cfg->dhcp_subnet;
-    char ip_str[16];
-    snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d", sn[0], sn[1], sn[2], sn[3]);
+    char usb_ip_str[16];
+    char wifi_ip_str[16];
+    format_ipv4(s_cfg->usb_subnet, usb_ip_str, sizeof(usb_ip_str));
+    format_ipv4(s_cfg->wifi_subnet, wifi_ip_str, sizeof(wifi_ip_str));
 
-    char page[5120];
-    int pos = 0;
     int8_t txp = s_cfg->wifi_tx_power;
     uint8_t ch = s_cfg->wifi_channel;
 
+    httpd_resp_set_type(req, "text/html");
+
 #define SEL(val) ((txp == (val)) ? " selected" : "")
-    pos += snprintf(page + pos, sizeof(page) - pos, "%s<div class='card'>", HTML_HEADER);
-    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
-    pos += snprintf(page + pos, sizeof(page) - pos,
+    httpd_resp_send_chunk(req, HTML_HEADER, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, "<div class='card'>", HTTPD_RESP_USE_STRLEN);
+    send_chunkf(req,
         "<h1>ESP32-NetLink Settings</h1>"
         "<form method='POST' action='/config'>"
         "<label>WiFi SSID</label>"
@@ -354,8 +349,7 @@ static esp_err_t config_get_handler(httpd_req_t *req)
         "<label>WiFi Password</label>"
         "<input type='password' name='wifi_pass' value='%s' maxlength='64'>",
         s_cfg->wifi_ssid, s_cfg->wifi_password);
-    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
-    pos += snprintf(page + pos, sizeof(page) - pos,
+    send_chunkf(req,
         "<label>WiFi TX Power</label>"
         "<select name='wifi_txp' style='width:100%%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:1em'>"
         "<option value='80'%s>20 dBm (max)</option>"
@@ -368,37 +362,69 @@ static esp_err_t config_get_handler(httpd_req_t *req)
         "</select>",
         SEL(80), SEL(68), SEL(60), SEL(44), SEL(34), SEL(20), SEL(8));
 #undef SEL
-    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
 
 #define CHSEL(v) ((ch == (v)) ? " selected" : "")
-    pos += snprintf(page + pos, sizeof(page) - pos,
+    send_chunkf(req,
         "<label>WiFi Channel</label>"
         "<select name='wifi_ch' style='width:100%%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:1em'>"
         "<option value='0'%s>Auto</option>", CHSEL(0));
-    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
     for (int i = 1; i <= 13; i++) {
-        pos += snprintf(page + pos, sizeof(page) - pos,
+        send_chunkf(req,
             "<option value='%d'%s>%d</option>", i, CHSEL(i), i);
-        if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
     }
-    pos += snprintf(page + pos, sizeof(page) - pos, "</select>");
+    httpd_resp_send_chunk(req, "</select>", HTTPD_RESP_USE_STRLEN);
 #undef CHSEL
-    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
 
-    pos += snprintf(page + pos, sizeof(page) - pos,
-        "<label>DHCP Subnet (e.g. 192.168.4.0/24)</label>"
-        "<input type='text' name='dhcp_subnet' value='%s/%d' required>"
+    send_chunkf(req,
+        "<label>USB Subnet (e.g. 192.168.5.0/24)</label>"
+        "<input type='text' name='usb_subnet' value='%s/%d' required>"
+        "<label>WiFi Subnet (e.g. 192.168.4.0/24)</label>"
+        "<input type='text' name='wifi_subnet' value='%s/%d' required>"
         "<div class='toggle'>"
         "<input type='checkbox' name='dhcp_gw' id='dhcp_gw' value='1'%s>"
         "<label for='dhcp_gw' style='margin:0'>Advertise gateway in DHCP</label></div>"
         "<div class='toggle'>"
         "<input type='checkbox' name='dhcp_dns' id='dhcp_dns' value='1'%s>"
         "<label for='dhcp_dns' style='margin:0'>Advertise DNS in DHCP</label></div>",
-        ip_str, s_cfg->dhcp_prefix_len,
+        usb_ip_str, s_cfg->usb_prefix_len,
+        wifi_ip_str, s_cfg->wifi_prefix_len,
         s_cfg->dhcp_gw_enabled ? " checked" : "",
         s_cfg->dhcp_dns_enabled ? " checked" : "");
-    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
-    pos += snprintf(page + pos, sizeof(page) - pos,
+
+    httpd_resp_send_chunk(req,
+        "<h2 style='margin-top:20px'>WiFi to USB Port Forwarding</h2>"
+        "<table><tr><th>On</th><th>Listen</th><th>Target IP</th><th>Target</th></tr>",
+        HTTPD_RESP_USE_STRLEN);
+    for (int i = 0; i < NETLINK_MAX_PORT_FORWARDS; i++) {
+        char target_ip[16] = "";
+        char listen_port[8] = "";
+        char target_port[8] = "";
+        if (s_cfg->port_forwards[i].target_ip) {
+            format_ipv4(s_cfg->port_forwards[i].target_ip, target_ip, sizeof(target_ip));
+        }
+        if (s_cfg->port_forwards[i].listen_port) {
+            snprintf(listen_port, sizeof(listen_port), "%u",
+                     s_cfg->port_forwards[i].listen_port);
+        }
+        if (s_cfg->port_forwards[i].target_port) {
+            snprintf(target_port, sizeof(target_port), "%u",
+                     s_cfg->port_forwards[i].target_port);
+        }
+        send_chunkf(req,
+            "<tr>"
+            "<td><input type='checkbox' name='pf%d_en' value='1'%s></td>"
+            "<td><input type='text' name='pf%d_lport' value='%s' placeholder='2222'></td>"
+            "<td><input type='text' name='pf%d_tip' value='%s' placeholder='192.168.5.2'></td>"
+            "<td><input type='text' name='pf%d_tport' value='%s' placeholder='22'></td>"
+            "</tr>",
+            i, s_cfg->port_forwards[i].enabled ? " checked" : "",
+            i, listen_port,
+            i, target_ip,
+            i, target_port);
+    }
+    httpd_resp_send_chunk(req, "</table>", HTTPD_RESP_USE_STRLEN);
+
+    send_chunkf(req,
         "<label>Admin Password</label>"
         "<input type='password' name='admin_pass' value='%s' maxlength='64' required>"
         "<button type='submit'>Save &amp; Reboot</button>"
@@ -407,10 +433,7 @@ static esp_err_t config_get_handler(httpd_req_t *req)
         "padding:10px 24px;border-radius:4px;text-decoration:none;font-size:1em;margin-top:16px'>"
         "Back to Dashboard</a>%s",
         s_cfg->admin_password, HTML_FOOTER);
-    if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
-
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, page, pos);
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -425,9 +448,27 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_auth_required(req);
 
-    char body[512];
-    int received = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (received <= 0) {
+    char body[2048];
+    if (req->content_len >= sizeof(body)) {
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        httpd_resp_send(req, "Config form is too large", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
+    }
+
+    int received = 0;
+    while (received < req->content_len) {
+        int chunk = httpd_req_recv(req, body + received,
+                                   req->content_len - received);
+        if (chunk == HTTPD_SOCK_ERR_TIMEOUT) {
+            continue;
+        }
+        if (chunk <= 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read body");
+            return ESP_FAIL;
+        }
+        received += chunk;
+    }
+    if (received == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty body");
         return ESP_FAIL;
     }
@@ -439,20 +480,16 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     get_form_value(body, "wifi_pass", new_cfg.wifi_password, sizeof(new_cfg.wifi_password));
     get_form_value(body, "admin_pass", new_cfg.admin_password, sizeof(new_cfg.admin_password));
 
-    char subnet_str[32];
-    if (get_form_value(body, "dhcp_subnet", subnet_str, sizeof(subnet_str))) {
-        char *slash = strchr(subnet_str, '/');
-        if (slash) {
-            *slash = '\0';
-            in_addr_t addr = inet_addr(subnet_str);
-            if (addr != INADDR_NONE) {
-                new_cfg.dhcp_subnet = addr;
-                int pfx = atoi(slash + 1);
-                if (pfx >= 8 && pfx <= 30) {
-                    new_cfg.dhcp_prefix_len = (uint8_t)pfx;
-                }
-            }
-        }
+    if (!parse_subnet_field(body, "usb_subnet",
+                            &new_cfg.usb_subnet, &new_cfg.usb_prefix_len)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid USB subnet");
+        return ESP_FAIL;
+    }
+
+    if (!parse_subnet_field(body, "wifi_subnet",
+                            &new_cfg.wifi_subnet, &new_cfg.wifi_prefix_len)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid WiFi subnet");
+        return ESP_FAIL;
     }
 
     char gw_val[4];
@@ -478,6 +515,84 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     if (strlen(new_cfg.admin_password) == 0) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Admin password cannot be empty");
         return ESP_FAIL;
+    }
+    if (router_subnets_overlap(new_cfg.usb_subnet, new_cfg.usb_prefix_len,
+                               new_cfg.wifi_subnet, new_cfg.wifi_prefix_len)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "USB and WiFi subnets must not overlap");
+        return ESP_FAIL;
+    }
+
+    for (int i = 0; i < NETLINK_MAX_PORT_FORWARDS; i++) {
+        port_forward_rule_t *rule = &new_cfg.port_forwards[i];
+        char key[16];
+        char value[32];
+
+        memset(rule, 0, sizeof(*rule));
+        snprintf(key, sizeof(key), "pf%d_en", i);
+        rule->enabled = get_form_value(body, key, value, sizeof(value)) ? 1 : 0;
+
+        snprintf(key, sizeof(key), "pf%d_lport", i);
+        bool has_lport = get_form_value(body, key, value, sizeof(value)) && value[0];
+        if (has_lport && !parse_port_u16(value, &rule->listen_port) && rule->enabled) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid listen port");
+            return ESP_FAIL;
+        }
+
+        snprintf(key, sizeof(key), "pf%d_tip", i);
+        bool has_tip = get_form_value(body, key, value, sizeof(value)) && value[0];
+        if (has_tip) {
+            in_addr_t target_ip = inet_addr(value);
+            if (target_ip == INADDR_NONE) {
+                if (rule->enabled) {
+                    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid target IP");
+                    return ESP_FAIL;
+                }
+            } else {
+                rule->target_ip = target_ip;
+            }
+        }
+
+        snprintf(key, sizeof(key), "pf%d_tport", i);
+        bool has_tport = get_form_value(body, key, value, sizeof(value)) && value[0];
+        if (has_tport && !parse_port_u16(value, &rule->target_port) && rule->enabled) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid target port");
+            return ESP_FAIL;
+        }
+
+        if (!rule->enabled) {
+            continue;
+        }
+        if (!has_lport || !has_tip || !has_tport ||
+            rule->listen_port == 0 || rule->target_port == 0 || rule->target_ip == 0) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Enabled port forward rule is incomplete");
+            return ESP_FAIL;
+        }
+        if (rule->listen_port == 80) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Listen port 80 is reserved for the web UI");
+            return ESP_FAIL;
+        }
+        if (!ip_in_subnet(rule->target_ip, new_cfg.usb_subnet, new_cfg.usb_prefix_len)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Target IP must be in the USB subnet");
+            return ESP_FAIL;
+        }
+
+        uint32_t mask = router_prefix_to_netmask(new_cfg.usb_prefix_len);
+        uint32_t network = new_cfg.usb_subnet & mask;
+        uint32_t gateway = network | htonl(1);
+        uint32_t broadcast = network | ~mask;
+        if (rule->target_ip == network || rule->target_ip == gateway ||
+            rule->target_ip == broadcast) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Target IP cannot be network, gateway, or broadcast");
+            return ESP_FAIL;
+        }
+
+        for (int j = 0; j < i; j++) {
+            if (new_cfg.port_forwards[j].enabled &&
+                new_cfg.port_forwards[j].listen_port == rule->listen_port) {
+                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Duplicate listen ports are not allowed");
+                return ESP_FAIL;
+            }
+        }
     }
 
     esp_err_t err = config_save(&new_cfg);
@@ -696,27 +811,31 @@ static esp_err_t diag_handler(httpd_req_t *req)
     }
     httpd_resp_send_chunk(req, "</div>", HTTPD_RESP_USE_STRLEN);
 
-    /* DHCP clients */
-    client_entry_t clients[10];
-    int ccnt = get_clients(clients, 10);
+    /* DHCP leases */
+    router_dhcp_lease_t leases[ROUTER_MAX_DHCP_LEASES];
+    size_t ccnt = router_get_dhcp_leases(leases, ROUTER_MAX_DHCP_LEASES);
     len = snprintf(buf, sizeof(buf),
-        "<div class='c'><h2>DHCP Clients (%d)</h2>", ccnt);
+        "<div class='c'><h2>DHCP Leases (%u)</h2>", (unsigned)ccnt);
     httpd_resp_send_chunk(req, buf, len);
     if (ccnt == 0) {
         httpd_resp_send_chunk(req, "<p style='color:#666'>None</p>",
                               HTTPD_RESP_USE_STRLEN);
     } else {
         httpd_resp_send_chunk(req,
-            "<table><tr><th>IP</th><th>MAC</th></tr>",
+            "<table><tr><th>If</th><th>IP</th><th>MAC</th><th>Expires</th></tr>",
             HTTPD_RESP_USE_STRLEN);
-        for (int i = 0; i < ccnt; i++) {
-            uint8_t *ip = (uint8_t *)&clients[i].ip;
-            uint8_t *m = clients[i].mac;
+        for (size_t i = 0; i < ccnt; i++) {
+            uint8_t *ip = (uint8_t *)&leases[i].ip;
+            uint8_t *m = leases[i].mac;
+            char expires[16];
+            format_duration(leases[i].expires_in_seconds, expires, sizeof(expires));
             len = snprintf(buf, sizeof(buf),
-                "<tr><td>%d.%d.%d.%d</td>"
-                "<td>%02x:%02x:%02x:%02x:%02x:%02x</td></tr>",
+                "<tr><td>%s</td><td>%d.%d.%d.%d</td>"
+                "<td>%02x:%02x:%02x:%02x:%02x:%02x</td><td>%s</td></tr>",
+                leases[i].iface,
                 ip[0], ip[1], ip[2], ip[3],
-                m[0], m[1], m[2], m[3], m[4], m[5]);
+                m[0], m[1], m[2], m[3], m[4], m[5],
+                expires);
             httpd_resp_send_chunk(req, buf, len);
         }
         httpd_resp_send_chunk(req, "</table>", HTTPD_RESP_USE_STRLEN);
@@ -780,13 +899,6 @@ static esp_err_t diag_handler(httpd_req_t *req)
 esp_err_t web_server_start(netlink_config_t *cfg)
 {
     s_cfg = cfg;
-
-    s_dhcp_mutex = xSemaphoreCreateMutex();
-    memset(s_dhcp_clients, 0, sizeof(s_dhcp_clients));
-    esp_event_handler_register(IP_EVENT, IP_EVENT_AP_STAIPASSIGNED,
-                               dhcp_event_handler, NULL);
-    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED,
-                               wifi_disconnect_handler, NULL);
 
     s_log_mutex = xSemaphoreCreateMutex();
     esp_log_set_vprintf(log_vprintf);
