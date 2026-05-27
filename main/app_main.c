@@ -81,9 +81,9 @@ void app_main(void)
     esp_netif_t *br_netif = bridge_create(&s_config);
     ESP_ERROR_CHECK(bridge_start(br_netif, usb_netif, wifi_netif));
 
+    ESP_ERROR_CHECK(web_server_start(&s_config));
     ESP_ERROR_CHECK(wifi_ap_start(&s_config));
     ESP_ERROR_CHECK(usb_ncm_start());
-    ESP_ERROR_CHECK(web_server_start(&s_config));
 
     s_booting = false;
     ESP_LOGI(TAG, "All systems up. Bridge ready.");

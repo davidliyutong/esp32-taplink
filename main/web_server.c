@@ -1,21 +1,57 @@
 #include "web_server.h"
 #include "bridge.h"
+#include "usb_ncm.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_netif.h"
 #include "esp_netif_net_stack.h"
+#include "esp_event.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 #include "freertos/semphr.h"
 #include "lwip/etharp.h"
 #include "lwip/tcpip.h"
+#include "lwip/netif.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <arpa/inet.h>
 
 static const char *TAG = "web";
 static netlink_config_t *s_cfg;
+
+/* ---- Log ring buffer ---- */
+
+#define LOG_LINES 30
+#define LOG_LINE_LEN 200
+
+static char s_log_buf[LOG_LINES][LOG_LINE_LEN];
+static int s_log_head;
+static int s_log_count;
+static SemaphoreHandle_t s_log_mutex;
+
+static int log_vprintf(const char *fmt, va_list args)
+{
+    va_list copy;
+    va_copy(copy, args);
+
+    if (s_log_mutex && xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        vsnprintf(s_log_buf[s_log_head], LOG_LINE_LEN, fmt, copy);
+        int len = strlen(s_log_buf[s_log_head]);
+        while (len > 0 && (s_log_buf[s_log_head][len - 1] == '\n' ||
+                           s_log_buf[s_log_head][len - 1] == '\r'))
+            s_log_buf[s_log_head][--len] = '\0';
+        s_log_head = (s_log_head + 1) % LOG_LINES;
+        if (s_log_count < LOG_LINES) s_log_count++;
+        xSemaphoreGive(s_log_mutex);
+    }
+
+    va_end(copy);
+    return vprintf(fmt, args);
+}
 
 /* ---- Base64 decode (for HTTP Basic Auth) ---- */
 
@@ -140,67 +176,99 @@ static const char HTML_HEADER[] =
 
 static const char HTML_FOOTER[] = "</body></html>";
 
-/* ---- ARP client enumeration ---- */
+/* ---- DHCP client tracking ---- */
 
 typedef struct {
     uint32_t ip;
     uint8_t mac[6];
 } client_entry_t;
 
-typedef struct {
-    client_entry_t *out;
-    int max_clients;
-    struct netif *br_lwip;
-    uint32_t self_ip;
-    int count;
-    SemaphoreHandle_t done;
-} arp_enum_ctx_t;
+#define MAX_DHCP_CLIENTS 10
+#define DHCP_CLIENT_TIMEOUT_US \
+    (((int64_t)BRIDGE_DHCP_LEASE_MINUTES + 5) * 60 * 1000000)
 
-static void arp_enum_fn(void *arg)
+typedef struct {
+    uint32_t ip;
+    uint8_t mac[6];
+    bool active;
+    int64_t last_seen_us;
+} dhcp_client_t;
+
+static dhcp_client_t s_dhcp_clients[MAX_DHCP_CLIENTS];
+static SemaphoreHandle_t s_dhcp_mutex;
+
+static void wifi_disconnect_handler(void *arg, esp_event_base_t base,
+                                     int32_t event_id, void *event_data)
 {
-    arp_enum_ctx_t *ctx = (arp_enum_ctx_t *)arg;
-    ctx->count = 0;
-    for (size_t i = 0; i < ARP_TABLE_SIZE && ctx->count < ctx->max_clients; i++) {
-        ip4_addr_t *ip = NULL;
-        struct netif *netif = NULL;
-        struct eth_addr *mac = NULL;
-        if (etharp_get_entry(i, &ip, &netif, &mac)) {
-            if (netif == ctx->br_lwip && ip->addr != ctx->self_ip) {
-                ctx->out[ctx->count].ip = ip->addr;
-                memcpy(ctx->out[ctx->count].mac, mac->addr, 6);
-                ctx->count++;
-            }
+    wifi_event_ap_stadisconnected_t *evt =
+        (wifi_event_ap_stadisconnected_t *)event_data;
+    if (!s_dhcp_mutex) return;
+
+    xSemaphoreTake(s_dhcp_mutex, portMAX_DELAY);
+    for (int i = 0; i < MAX_DHCP_CLIENTS; i++) {
+        if (s_dhcp_clients[i].active &&
+            memcmp(s_dhcp_clients[i].mac, evt->mac, 6) == 0) {
+            s_dhcp_clients[i].active = false;
+            break;
         }
     }
-    xSemaphoreGive(ctx->done);
+    xSemaphoreGive(s_dhcp_mutex);
+}
+
+static void dhcp_event_handler(void *arg, esp_event_base_t base,
+                                int32_t event_id, void *event_data)
+{
+    ip_event_ap_staipassigned_t *evt = (ip_event_ap_staipassigned_t *)event_data;
+    if (!s_dhcp_mutex) return;
+
+    xSemaphoreTake(s_dhcp_mutex, portMAX_DELAY);
+
+    int free_slot = -1;
+    for (int i = 0; i < MAX_DHCP_CLIENTS; i++) {
+        if (s_dhcp_clients[i].active &&
+            memcmp(s_dhcp_clients[i].mac, evt->mac, 6) == 0) {
+            s_dhcp_clients[i].ip = evt->ip.addr;
+            s_dhcp_clients[i].last_seen_us = esp_timer_get_time();
+            xSemaphoreGive(s_dhcp_mutex);
+            return;
+        }
+        if (!s_dhcp_clients[i].active && free_slot < 0)
+            free_slot = i;
+    }
+
+    if (free_slot >= 0) {
+        s_dhcp_clients[free_slot].ip = evt->ip.addr;
+        memcpy(s_dhcp_clients[free_slot].mac, evt->mac, 6);
+        s_dhcp_clients[free_slot].last_seen_us = esp_timer_get_time();
+        s_dhcp_clients[free_slot].active = true;
+    }
+
+    xSemaphoreGive(s_dhcp_mutex);
 }
 
 static int get_clients(client_entry_t *out, int max_clients)
 {
-    esp_netif_t *br = bridge_get_netif();
-    if (!br) return 0;
+    if (!s_dhcp_mutex) return 0;
 
-    struct netif *br_lwip = esp_netif_get_netif_impl(br);
-    if (!br_lwip) return 0;
+    xSemaphoreTake(s_dhcp_mutex, portMAX_DELAY);
 
-    esp_netif_ip_info_t ip_info;
-    esp_netif_get_ip_info(br, &ip_info);
+    int64_t now = esp_timer_get_time();
+    int count = 0;
 
-    arp_enum_ctx_t ctx = {
-        .out = out,
-        .max_clients = max_clients,
-        .br_lwip = br_lwip,
-        .self_ip = ip_info.ip.addr,
-        .count = 0,
-        .done = xSemaphoreCreateBinary(),
-    };
-    if (!ctx.done) return 0;
-
-    if (tcpip_callback(arp_enum_fn, &ctx) == ERR_OK) {
-        xSemaphoreTake(ctx.done, portMAX_DELAY);
+    for (int i = 0; i < MAX_DHCP_CLIENTS && count < max_clients; i++) {
+        if (s_dhcp_clients[i].active) {
+            if (now - s_dhcp_clients[i].last_seen_us < DHCP_CLIENT_TIMEOUT_US) {
+                out[count].ip = s_dhcp_clients[i].ip;
+                memcpy(out[count].mac, s_dhcp_clients[i].mac, 6);
+                count++;
+            } else {
+                s_dhcp_clients[i].active = false;
+            }
+        }
     }
-    vSemaphoreDelete(ctx.done);
-    return ctx.count;
+
+    xSemaphoreGive(s_dhcp_mutex);
+    return count;
 }
 
 /* ---- GET / (dashboard) ---- */
@@ -217,7 +285,7 @@ static esp_err_t dashboard_handler(httpd_req_t *req)
 
     pos += snprintf(page + pos, sizeof(page) - pos,
         "%s<div class='card'><h1>ESP32-NetLink</h1>"
-        "<h2>Connected Devices</h2>",
+        "<h2>DHCP Clients</h2>",
         HTML_HEADER);
     if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
 
@@ -248,6 +316,9 @@ static esp_err_t dashboard_handler(httpd_req_t *req)
         "<a href='/config' style='display:block;text-align:center;background:#2196F3;color:#fff;"
         "padding:10px 24px;border-radius:4px;text-decoration:none;font-size:1em;margin-top:16px'>"
         "Settings</a>"
+        "<a href='/diag' style='display:block;text-align:center;background:#757575;color:#fff;"
+        "padding:10px 24px;border-radius:4px;text-decoration:none;font-size:1em;margin-top:8px'>"
+        "Diagnostics</a>"
         "%s",
         HTML_FOOTER);
     if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
@@ -434,11 +505,291 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---- GET /diag (diagnostics) ---- */
+
+typedef struct {
+    char name[6];
+    uint32_t ip;
+    uint32_t netmask;
+    uint8_t mac[6];
+    bool up;
+    bool link_up;
+} netif_diag_t;
+
+typedef struct {
+    uint32_t ip;
+    uint8_t mac[6];
+    char netif_name[6];
+} arp_diag_t;
+
+typedef struct {
+    netif_diag_t netifs[8];
+    int netif_count;
+    arp_diag_t arps[16];
+    int arp_count;
+    SemaphoreHandle_t done;
+} diag_lwip_ctx_t;
+
+static void diag_collect_fn(void *arg)
+{
+    diag_lwip_ctx_t *ctx = (diag_lwip_ctx_t *)arg;
+
+    ctx->netif_count = 0;
+    struct netif *n;
+    NETIF_FOREACH(n) {
+        if (ctx->netif_count >= 8) break;
+        netif_diag_t *d = &ctx->netifs[ctx->netif_count];
+        snprintf(d->name, sizeof(d->name), "%c%c%d",
+                 n->name[0], n->name[1], n->num);
+        d->ip = netif_ip4_addr(n)->addr;
+        d->netmask = netif_ip4_netmask(n)->addr;
+        memcpy(d->mac, n->hwaddr, 6);
+        d->up = !!(n->flags & NETIF_FLAG_UP);
+        d->link_up = !!(n->flags & NETIF_FLAG_LINK_UP);
+        ctx->netif_count++;
+    }
+
+    ctx->arp_count = 0;
+    for (size_t i = 0; i < ARP_TABLE_SIZE && ctx->arp_count < 16; i++) {
+        ip4_addr_t *ip = NULL;
+        struct netif *netif = NULL;
+        struct eth_addr *mac = NULL;
+        if (etharp_get_entry(i, &ip, &netif, &mac)) {
+            arp_diag_t *a = &ctx->arps[ctx->arp_count];
+            a->ip = ip->addr;
+            memcpy(a->mac, mac->addr, 6);
+            snprintf(a->netif_name, sizeof(a->netif_name), "%c%c%d",
+                     netif->name[0], netif->name[1], netif->num);
+            ctx->arp_count++;
+        }
+    }
+
+    xSemaphoreGive(ctx->done);
+}
+
+static void html_escape_chunk(httpd_req_t *req, const char *src)
+{
+    char buf[512];
+    size_t di = 0;
+    for (size_t i = 0; src[i]; i++) {
+        const char *esc = NULL;
+        size_t elen = 0;
+        switch (src[i]) {
+        case '<': esc = "&lt;";  elen = 4; break;
+        case '>': esc = "&gt;";  elen = 4; break;
+        case '&': esc = "&amp;"; elen = 5; break;
+        }
+        if (esc) {
+            if (di + elen >= sizeof(buf) - 1) {
+                buf[di] = '\0';
+                httpd_resp_send_chunk(req, buf, di);
+                di = 0;
+            }
+            memcpy(buf + di, esc, elen);
+            di += elen;
+        } else {
+            buf[di++] = src[i];
+        }
+        if (di >= sizeof(buf) - 8) {
+            buf[di] = '\0';
+            httpd_resp_send_chunk(req, buf, di);
+            di = 0;
+        }
+    }
+    if (di > 0) {
+        buf[di] = '\0';
+        httpd_resp_send_chunk(req, buf, di);
+    }
+}
+
+static esp_err_t diag_handler(httpd_req_t *req)
+{
+    if (!check_auth(req)) return send_auth_required(req);
+
+    httpd_resp_set_type(req, "text/html");
+
+    diag_lwip_ctx_t lwip_ctx = { .done = xSemaphoreCreateBinary() };
+    if (lwip_ctx.done) {
+        if (tcpip_callback(diag_collect_fn, &lwip_ctx) == ERR_OK)
+            xSemaphoreTake(lwip_ctx.done, portMAX_DELAY);
+        vSemaphoreDelete(lwip_ctx.done);
+    }
+
+    wifi_sta_list_t sta_list = {0};
+    esp_wifi_ap_get_sta_list(&sta_list);
+
+    char buf[512];
+    int len;
+
+    httpd_resp_send_chunk(req,
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta http-equiv='refresh' content='5'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Diagnostics</title><style>"
+        "body{font-family:monospace;max-width:600px;margin:20px auto;padding:0 10px;"
+        "background:#1a1a2e;color:#e0e0e0}"
+        ".c{background:#16213e;border-radius:8px;padding:12px;margin-bottom:10px}"
+        "h2{color:#e94560;font-size:1em;margin:0 0 6px}"
+        "table{width:100%;border-collapse:collapse;font-size:.85em}"
+        "th,td{padding:3px 6px;text-align:left;border-bottom:1px solid #0f3460}"
+        "th{color:#e94560}"
+        ".g{color:#4ecca3}.r{color:#e94560}"
+        "pre{background:#0f3460;padding:8px;border-radius:4px;font-size:.78em;"
+        "max-height:400px;overflow:auto;white-space:pre-wrap;word-break:break-all}"
+        "a{color:#4ecca3}"
+        "</style></head><body><h1 style='color:#e94560;font-size:1.2em'>Diagnostics</h1>",
+        HTTPD_RESP_USE_STRLEN);
+
+    /* Network interfaces */
+    httpd_resp_send_chunk(req,
+        "<div class='c'><h2>Network Interfaces</h2>"
+        "<table><tr><th>Name</th><th>IP</th><th>MAC</th><th>State</th></tr>",
+        HTTPD_RESP_USE_STRLEN);
+    for (int i = 0; i < lwip_ctx.netif_count; i++) {
+        netif_diag_t *d = &lwip_ctx.netifs[i];
+        uint8_t *ip = (uint8_t *)&d->ip;
+        uint8_t *m = d->mac;
+        len = snprintf(buf, sizeof(buf),
+            "<tr><td>%s</td><td>%d.%d.%d.%d</td>"
+            "<td>%02x:%02x:%02x:%02x:%02x:%02x</td>"
+            "<td class='%s'>%s%s</td></tr>",
+            d->name, ip[0], ip[1], ip[2], ip[3],
+            m[0], m[1], m[2], m[3], m[4], m[5],
+            (d->up && d->link_up) ? "g" : "r",
+            d->up ? "UP" : "DOWN",
+            d->link_up ? " LINK" : "");
+        httpd_resp_send_chunk(req, buf, len);
+    }
+    httpd_resp_send_chunk(req, "</table></div>", HTTPD_RESP_USE_STRLEN);
+
+    /* USB NCM */
+    len = snprintf(buf, sizeof(buf),
+        "<div class='c'><h2>USB NCM</h2>"
+        "<table><tr><th>Status</th><th>RX pkts</th><th>TX pkts</th></tr>"
+        "<tr><td class='%s'>%s</td><td>%lu</td><td>%lu</td></tr></table></div>",
+        usb_ncm_is_connected() ? "g" : "r",
+        usb_ncm_is_connected() ? "Connected" : "Disconnected",
+        (unsigned long)usb_ncm_get_rx_count(),
+        (unsigned long)usb_ncm_get_tx_count());
+    httpd_resp_send_chunk(req, buf, len);
+
+    /* WiFi stations */
+    len = snprintf(buf, sizeof(buf),
+        "<div class='c'><h2>WiFi Stations (%d)</h2>", sta_list.num);
+    httpd_resp_send_chunk(req, buf, len);
+    if (sta_list.num == 0) {
+        httpd_resp_send_chunk(req, "<p style='color:#666'>None</p>",
+                              HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_send_chunk(req,
+            "<table><tr><th>MAC</th><th>RSSI</th></tr>",
+            HTTPD_RESP_USE_STRLEN);
+        for (int i = 0; i < sta_list.num; i++) {
+            uint8_t *m = sta_list.sta[i].mac;
+            len = snprintf(buf, sizeof(buf),
+                "<tr><td>%02x:%02x:%02x:%02x:%02x:%02x</td><td>%d</td></tr>",
+                m[0], m[1], m[2], m[3], m[4], m[5],
+                sta_list.sta[i].rssi);
+            httpd_resp_send_chunk(req, buf, len);
+        }
+        httpd_resp_send_chunk(req, "</table>", HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_send_chunk(req, "</div>", HTTPD_RESP_USE_STRLEN);
+
+    /* DHCP clients */
+    client_entry_t clients[10];
+    int ccnt = get_clients(clients, 10);
+    len = snprintf(buf, sizeof(buf),
+        "<div class='c'><h2>DHCP Clients (%d)</h2>", ccnt);
+    httpd_resp_send_chunk(req, buf, len);
+    if (ccnt == 0) {
+        httpd_resp_send_chunk(req, "<p style='color:#666'>None</p>",
+                              HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_send_chunk(req,
+            "<table><tr><th>IP</th><th>MAC</th></tr>",
+            HTTPD_RESP_USE_STRLEN);
+        for (int i = 0; i < ccnt; i++) {
+            uint8_t *ip = (uint8_t *)&clients[i].ip;
+            uint8_t *m = clients[i].mac;
+            len = snprintf(buf, sizeof(buf),
+                "<tr><td>%d.%d.%d.%d</td>"
+                "<td>%02x:%02x:%02x:%02x:%02x:%02x</td></tr>",
+                ip[0], ip[1], ip[2], ip[3],
+                m[0], m[1], m[2], m[3], m[4], m[5]);
+            httpd_resp_send_chunk(req, buf, len);
+        }
+        httpd_resp_send_chunk(req, "</table>", HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_send_chunk(req, "</div>", HTTPD_RESP_USE_STRLEN);
+
+    /* ARP table */
+    len = snprintf(buf, sizeof(buf),
+        "<div class='c'><h2>ARP Table (%d)</h2>", lwip_ctx.arp_count);
+    httpd_resp_send_chunk(req, buf, len);
+    if (lwip_ctx.arp_count == 0) {
+        httpd_resp_send_chunk(req, "<p style='color:#666'>Empty</p>",
+                              HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_send_chunk(req,
+            "<table><tr><th>IP</th><th>MAC</th><th>Netif</th></tr>",
+            HTTPD_RESP_USE_STRLEN);
+        for (int i = 0; i < lwip_ctx.arp_count; i++) {
+            uint8_t *ip = (uint8_t *)&lwip_ctx.arps[i].ip;
+            uint8_t *m = lwip_ctx.arps[i].mac;
+            len = snprintf(buf, sizeof(buf),
+                "<tr><td>%d.%d.%d.%d</td>"
+                "<td>%02x:%02x:%02x:%02x:%02x:%02x</td>"
+                "<td>%s</td></tr>",
+                ip[0], ip[1], ip[2], ip[3],
+                m[0], m[1], m[2], m[3], m[4], m[5],
+                lwip_ctx.arps[i].netif_name);
+            httpd_resp_send_chunk(req, buf, len);
+        }
+        httpd_resp_send_chunk(req, "</table>", HTTPD_RESP_USE_STRLEN);
+    }
+    httpd_resp_send_chunk(req, "</div>", HTTPD_RESP_USE_STRLEN);
+
+    /* Recent logs */
+    httpd_resp_send_chunk(req,
+        "<div class='c'><h2>Recent Logs</h2><pre>",
+        HTTPD_RESP_USE_STRLEN);
+    if (s_log_mutex && xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        int start = (s_log_count < LOG_LINES) ? 0 : s_log_head;
+        int total = (s_log_count < LOG_LINES) ? s_log_count : LOG_LINES;
+        for (int i = 0; i < total; i++) {
+            int idx = (start + i) % LOG_LINES;
+            html_escape_chunk(req, s_log_buf[idx]);
+            httpd_resp_send_chunk(req, "\n", 1);
+        }
+        xSemaphoreGive(s_log_mutex);
+    }
+    httpd_resp_send_chunk(req, "</pre></div>", HTTPD_RESP_USE_STRLEN);
+
+    httpd_resp_send_chunk(req,
+        "<a href='/' style='display:block;text-align:center;background:#0f3460;"
+        "color:#e0e0e0;padding:10px;border-radius:4px;text-decoration:none;"
+        "margin-top:10px'>Back to Dashboard</a></body></html>",
+        HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
 /* ---- Start ---- */
 
 esp_err_t web_server_start(netlink_config_t *cfg)
 {
     s_cfg = cfg;
+
+    s_dhcp_mutex = xSemaphoreCreateMutex();
+    memset(s_dhcp_clients, 0, sizeof(s_dhcp_clients));
+    esp_event_handler_register(IP_EVENT, IP_EVENT_AP_STAIPASSIGNED,
+                               dhcp_event_handler, NULL);
+    esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED,
+                               wifi_disconnect_handler, NULL);
+
+    s_log_mutex = xSemaphoreCreateMutex();
+    esp_log_set_vprintf(log_vprintf);
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 8192;
@@ -459,10 +810,14 @@ esp_err_t web_server_start(netlink_config_t *cfg)
     const httpd_uri_t config_post = {
         .uri = "/config", .method = HTTP_POST, .handler = config_post_handler,
     };
+    const httpd_uri_t diag = {
+        .uri = "/diag", .method = HTTP_GET, .handler = diag_handler,
+    };
 
     httpd_register_uri_handler(server, &dashboard);
     httpd_register_uri_handler(server, &config_get);
     httpd_register_uri_handler(server, &config_post);
+    httpd_register_uri_handler(server, &diag);
 
     ESP_LOGI(TAG, "Web server started on port %d", config.server_port);
     return ESP_OK;

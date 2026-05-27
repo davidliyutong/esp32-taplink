@@ -17,10 +17,14 @@ typedef struct {
 } usb_ncm_driver_t;
 
 static usb_ncm_driver_t s_driver;
+static volatile bool s_started;
 static volatile bool s_connected;
+static volatile uint32_t s_rx_count;
+static volatile uint32_t s_tx_count;
 
 static esp_err_t usb_ncm_transmit(void *h, void *buffer, size_t len)
 {
+    s_tx_count++;
     return tinyusb_net_send_sync(buffer, len, NULL, pdMS_TO_TICKS(100));
 }
 
@@ -39,10 +43,14 @@ static esp_err_t usb_ncm_recv_cb(void *buffer, uint16_t len, void *ctx)
             return ESP_ERR_NO_MEM;
         }
         memcpy(buf_copy, buffer, len);
+        s_rx_count++;
         esp_netif_receive(driver->base.netif, buf_copy, len, buf_copy);
     }
     return ESP_OK;
 }
+
+uint32_t usb_ncm_get_rx_count(void) { return s_rx_count; }
+uint32_t usb_ncm_get_tx_count(void) { return s_tx_count; }
 
 static void usb_ncm_port_event_handler(void *arg, esp_event_base_t base, int32_t event_id, void *event_data)
 {
@@ -75,21 +83,38 @@ bool usb_ncm_is_connected(void)
 static void usb_event_cb(tinyusb_event_t *event, void *arg)
 {
     if (event->id == TINYUSB_EVENT_DETACHED) {
-        s_connected = false;
-        ESP_LOGW(TAG, "USB host disconnected");
-        void *handle = &s_driver;
-        esp_event_post(ETH_EVENT, ETHERNET_EVENT_DISCONNECTED, &handle, sizeof(handle), 0);
+        if (s_connected) {
+            s_connected = false;
+            ESP_LOGW(TAG, "USB host disconnected");
+            void *handle = &s_driver;
+            esp_event_post(ETH_EVENT, ETHERNET_EVENT_DISCONNECTED, &handle, sizeof(handle), 0);
+        }
     }
+}
+
+static void usb_ncm_post_start_once(void)
+{
+    if (s_started) return;
+
+    s_started = true;
+    void *handle = &s_driver;
+    esp_event_post(ETH_EVENT, ETHERNET_EVENT_START, &handle, sizeof(handle), portMAX_DELAY);
+}
+
+static void usb_ncm_post_connected_once(void)
+{
+    if (s_connected) return;
+
+    s_connected = true;
+    void *handle = &s_driver;
+    esp_event_post(ETH_EVENT, ETHERNET_EVENT_CONNECTED, &handle, sizeof(handle), 0);
 }
 
 static void usb_ncm_init_cb(void *ctx)
 {
-    bool reconnect = s_connected;
-    s_connected = true;
-    ESP_LOGI(TAG, "USB NCM %s by host", reconnect ? "re-initialized" : "initialized");
-    void *handle = &s_driver;
-    esp_event_post(ETH_EVENT, ETHERNET_EVENT_START, &handle, sizeof(handle), 0);
-    esp_event_post(ETH_EVENT, ETHERNET_EVENT_CONNECTED, &handle, sizeof(handle), 0);
+    usb_ncm_post_start_once();
+    usb_ncm_post_connected_once();
+    ESP_LOGI(TAG, "USB NCM initialized by host");
 }
 
 static esp_err_t usb_ncm_post_attach(esp_netif_t *esp_netif, void *args)
@@ -125,7 +150,7 @@ esp_netif_t *usb_ncm_netif_create(void)
         .lost_ip_event = 0,
         .if_key = "USB_NCM",
         .if_desc = "usb ncm",
-        .route_prio = 50,
+        .route_prio = 0,
         .bridge_info = NULL,
     };
 
@@ -164,9 +189,8 @@ esp_err_t usb_ncm_start(void)
     memcpy(net_cfg.mac_addr, s_driver.mac_addr, 6);
     ESP_ERROR_CHECK(tinyusb_net_init(&net_cfg));
 
-    void *handle = &s_driver;
-    esp_event_post(ETH_EVENT, ETHERNET_EVENT_START, &handle, sizeof(handle), portMAX_DELAY);
-    esp_event_post(ETH_EVENT, ETHERNET_EVENT_CONNECTED, &handle, sizeof(handle), portMAX_DELAY);
+    usb_ncm_post_start_once();
+    usb_ncm_post_connected_once();
 
     ESP_LOGI(TAG, "USB NCM started");
     return ESP_OK;

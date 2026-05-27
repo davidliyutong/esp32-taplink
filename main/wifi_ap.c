@@ -73,6 +73,7 @@ esp_netif_t *wifi_ap_create(void)
     esp_netif_inherent_config_t wifi_cfg = ESP_NETIF_INHERENT_DEFAULT_WIFI_AP();
     wifi_cfg.flags = ESP_NETIF_FLAG_AUTOUP;
     wifi_cfg.ip_info = NULL;
+    wifi_cfg.route_prio = 0;
 
     esp_netif_t *netif = esp_netif_create_wifi(WIFI_IF_AP, &wifi_cfg);
     assert(netif);
