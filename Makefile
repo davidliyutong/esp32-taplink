@@ -77,7 +77,7 @@ lint:
 # ---------- Help ----------
 
 help:
-	@echo "esp32-netlink — build targets"
+	@echo "esp32-taplink — build targets"
 	@echo ""
 	@echo "  Setup (run once):"
 	@echo "    make setup                 Clone + install ESP-IDF locally"

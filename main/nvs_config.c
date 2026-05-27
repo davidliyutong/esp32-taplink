@@ -8,7 +8,7 @@
 #include <string.h>
 
 static const char *TAG = "config";
-static const char *NVS_NAMESPACE = "netlink";
+static const char *NVS_NAMESPACE = "taplink";
 
 static uint32_t prefix_to_netmask(uint8_t prefix_len)
 {
@@ -46,9 +46,9 @@ static bool network_is_valid(uint32_t subnet, uint8_t prefix_len)
     return (subnet & ~mask) == 0;
 }
 
-static void config_sanitize(netlink_config_t *cfg)
+static void config_sanitize(taplink_config_t *cfg)
 {
-    netlink_config_t defaults;
+    taplink_config_t defaults;
     config_get_defaults(&defaults);
 
     cfg->wifi_ssid[sizeof(cfg->wifi_ssid) - 1] = '\0';
@@ -90,14 +90,14 @@ static void config_sanitize(netlink_config_t *cfg)
         cfg->wifi_channel = defaults.wifi_channel;
     }
 
-    uint16_t used_listen_ports[NETLINK_MAX_PORT_FORWARDS] = {0};
+    uint16_t used_listen_ports[TAPLINK_MAX_PORT_FORWARDS] = {0};
     size_t used_count = 0;
     uint32_t usb_mask = prefix_to_netmask(cfg->usb_prefix_len);
     uint32_t usb_network = cfg->usb_subnet & usb_mask;
     uint32_t usb_gateway = usb_network | htonl(1);
     uint32_t usb_broadcast = usb_network | ~usb_mask;
 
-    for (int i = 0; i < NETLINK_MAX_PORT_FORWARDS; i++) {
+    for (int i = 0; i < TAPLINK_MAX_PORT_FORWARDS; i++) {
         port_forward_rule_t *rule = &cfg->port_forwards[i];
         if (!rule->enabled) {
             memset(rule, 0, sizeof(*rule));
@@ -127,10 +127,10 @@ static void config_sanitize(netlink_config_t *cfg)
     }
 }
 
-void config_get_defaults(netlink_config_t *cfg)
+void config_get_defaults(taplink_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
-    strcpy(cfg->wifi_ssid, "ESP32-NetLink");
+    strcpy(cfg->wifi_ssid, "ESP32-TapLink");
     strcpy(cfg->wifi_password, "12345678");
     strcpy(cfg->admin_password, "admin");
     cfg->usb_subnet = inet_addr("192.168.5.0");
@@ -143,7 +143,7 @@ void config_get_defaults(netlink_config_t *cfg)
     cfg->wifi_channel = 0;
 }
 
-esp_err_t config_load(netlink_config_t *cfg)
+esp_err_t config_load(taplink_config_t *cfg)
 {
     config_get_defaults(cfg);
 
@@ -185,7 +185,7 @@ esp_err_t config_load(netlink_config_t *cfg)
     nvs_get_i8(handle, "wifi_txp", &cfg->wifi_tx_power);
     nvs_get_u8(handle, "wifi_ch", &cfg->wifi_channel);
 
-    for (int i = 0; i < NETLINK_MAX_PORT_FORWARDS; i++) {
+    for (int i = 0; i < TAPLINK_MAX_PORT_FORWARDS; i++) {
         char key[16];
         snprintf(key, sizeof(key), "pf%d_enabled", i);
         nvs_get_u8(handle, key, &cfg->port_forwards[i].enabled);
@@ -207,7 +207,7 @@ esp_err_t config_load(netlink_config_t *cfg)
     return ESP_OK;
 }
 
-esp_err_t config_save(const netlink_config_t *cfg)
+esp_err_t config_save(const taplink_config_t *cfg)
 {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
@@ -234,7 +234,7 @@ esp_err_t config_save(const netlink_config_t *cfg)
     CHECK_NVS(nvs_set_i8(handle, "wifi_txp", cfg->wifi_tx_power));
     CHECK_NVS(nvs_set_u8(handle, "wifi_ch", cfg->wifi_channel));
 
-    for (int i = 0; i < NETLINK_MAX_PORT_FORWARDS; i++) {
+    for (int i = 0; i < TAPLINK_MAX_PORT_FORWARDS; i++) {
         char key[16];
         snprintf(key, sizeof(key), "pf%d_enabled", i);
         CHECK_NVS(nvs_set_u8(handle, key, cfg->port_forwards[i].enabled));

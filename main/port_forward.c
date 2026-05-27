@@ -41,8 +41,8 @@ typedef struct
     int client_fd;
 } port_forward_session_t;
 
-static port_forward_listener_t s_listeners[NETLINK_MAX_PORT_FORWARDS];
-static TaskHandle_t s_listener_tasks[NETLINK_MAX_PORT_FORWARDS];
+static port_forward_listener_t s_listeners[TAPLINK_MAX_PORT_FORWARDS];
+static TaskHandle_t s_listener_tasks[TAPLINK_MAX_PORT_FORWARDS];
 static bool s_started;
 
 static bool ip_in_subnet(uint32_t ip, uint32_t subnet, uint8_t prefix_len)
@@ -311,7 +311,7 @@ static void listener_task(void *arg)
     }
 }
 
-static bool rule_is_valid(const netlink_config_t *cfg, const port_forward_rule_t *rule)
+static bool rule_is_valid(const taplink_config_t *cfg, const port_forward_rule_t *rule)
 {
     if (!rule->enabled) {
         return false;
@@ -325,7 +325,7 @@ static bool rule_is_valid(const netlink_config_t *cfg, const port_forward_rule_t
     return true;
 }
 
-esp_err_t port_forward_start(const netlink_config_t *cfg)
+esp_err_t port_forward_start(const taplink_config_t *cfg)
 {
     if (s_started) {
         return ESP_OK;
@@ -334,7 +334,7 @@ esp_err_t port_forward_start(const netlink_config_t *cfg)
     esp_netif_ip_info_t wifi_ip;
     router_make_ip_info(cfg->wifi_subnet, cfg->wifi_prefix_len, true, &wifi_ip);
 
-    for (int i = 0; i < NETLINK_MAX_PORT_FORWARDS; i++) {
+    for (int i = 0; i < TAPLINK_MAX_PORT_FORWARDS; i++) {
         const port_forward_rule_t *rule = &cfg->port_forwards[i];
         if (!rule_is_valid(cfg, rule)) {
             continue;

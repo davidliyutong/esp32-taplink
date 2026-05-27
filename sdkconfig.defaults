@@ -1,5 +1,5 @@
 # ================================================================
-# sdkconfig.defaults — esp32-netlink
+# sdkconfig.defaults — esp32-taplink
 # ================================================================
 
 # -------- C++ --------
@@ -34,6 +34,14 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 
 # -------- Network Routing --------
 CONFIG_LWIP_IP_FORWARD=y
+
+# -------- Flash / Partition --------
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# -------- OTA --------
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # -------- LWIP --------
 CONFIG_LWIP_IP4_FRAG=y

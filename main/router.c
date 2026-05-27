@@ -43,7 +43,7 @@ typedef struct
 
 static esp_netif_t *s_usb_netif;
 static esp_netif_t *s_wifi_netif;
-static const netlink_config_t *s_cfg;
+static const taplink_config_t *s_cfg;
 static router_dhcp_lease_slot_t s_dhcp_leases[ROUTER_MAX_DHCP_LEASES];
 static portMUX_TYPE s_dhcp_leases_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -348,7 +348,7 @@ s16_t router_observe_dhcps_state(struct dhcps_msg *msg, u16_t len, s16_t state)
     return state;
 }
 
-esp_err_t router_start(esp_netif_t *usb_netif, esp_netif_t *wifi_netif, const netlink_config_t *cfg)
+esp_err_t router_start(esp_netif_t *usb_netif, esp_netif_t *wifi_netif, const taplink_config_t *cfg)
 {
     s_usb_netif = usb_netif;
     s_wifi_netif = wifi_netif;

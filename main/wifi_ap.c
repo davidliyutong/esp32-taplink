@@ -11,7 +11,7 @@ static const char *TAG = "wifi_ap";
 
 static int s_sta_count = 0;
 static int s_restart_attempts = 0;
-static const netlink_config_t *s_ap_cfg = NULL;
+static const taplink_config_t *s_ap_cfg = NULL;
 
 static void ap_restart_timer_cb(TimerHandle_t timer)
 {
@@ -69,7 +69,7 @@ int wifi_ap_get_sta_count(void)
     return s_sta_count;
 }
 
-esp_netif_t *wifi_ap_create(const netlink_config_t *cfg)
+esp_netif_t *wifi_ap_create(const taplink_config_t *cfg)
 {
     esp_netif_inherent_config_t wifi_cfg = ESP_NETIF_INHERENT_DEFAULT_WIFI_AP();
     esp_netif_ip_info_t ip_info;
@@ -86,7 +86,7 @@ esp_netif_t *wifi_ap_create(const netlink_config_t *cfg)
     return netif;
 }
 
-esp_err_t wifi_ap_start(const netlink_config_t *cfg)
+esp_err_t wifi_ap_start(const taplink_config_t *cfg)
 {
     s_ap_cfg = cfg;
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));

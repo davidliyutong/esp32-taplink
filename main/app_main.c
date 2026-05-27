@@ -1,6 +1,7 @@
 #include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_pm.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -24,7 +25,7 @@ static const char *TAG = "main";
 #define RESET_HOLD_MS 5000
 #define PM_MIN_FREQ_MHZ 80
 
-static netlink_config_t s_config;
+static taplink_config_t s_config;
 static volatile bool s_booting = true;
 
 static void configure_power_management(void)
@@ -77,7 +78,7 @@ static void led_button_task(void *arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "esp32-netlink starting (version: %s)", FIRMWARE_VERSION);
+    ESP_LOGI(TAG, "esp32-taplink starting (version: %s)", FIRMWARE_VERSION);
 
     xTaskCreate(led_button_task, "led_btn", 2048, NULL, 1, NULL);
 
@@ -107,5 +108,6 @@ void app_main(void)
     ESP_ERROR_CHECK(port_forward_start(&s_config));
 
     s_booting = false;
+    esp_ota_mark_app_valid_cancel_rollback();
     ESP_LOGI(TAG, "All systems up. Router ready.");
 }

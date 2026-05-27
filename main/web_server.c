@@ -1,6 +1,8 @@
 #include "web_server.h"
+#include "esp_app_desc.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -20,7 +22,7 @@
 #include <string.h>
 
 static const char *TAG = "web";
-static netlink_config_t *s_cfg;
+static taplink_config_t *s_cfg;
 
 /* ---- Log ring buffer ---- */
 
@@ -107,7 +109,7 @@ static bool check_auth(httpd_req_t *req)
 static esp_err_t send_auth_required(httpd_req_t *req)
 {
     httpd_resp_set_status(req, "401 Unauthorized");
-    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP32-NetLink\"");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP32-TapLink\"");
     httpd_resp_send(req, "Unauthorized", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
@@ -156,7 +158,7 @@ static bool get_form_value(const char *body, const char *key, char *out, size_t 
 
 static const char HTML_HEADER[] = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
                                   "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                                  "<title>ESP32-NetLink</title>"
+                                  "<title>ESP32-TapLink</title>"
                                   "<link rel='stylesheet' href='/style.css'></head><body><main>";
 
 static const char HTML_FOOTER[] = "</main></body></html>";
@@ -292,7 +294,7 @@ static esp_err_t send_page_start(httpd_req_t *req, const char *active, bool refr
                               "<!DOCTYPE html><html><head><meta charset='utf-8'>"
                               "<meta http-equiv='refresh' content='15'>"
                               "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                              "<title>ESP32-NetLink</title>"
+                              "<title>ESP32-TapLink</title>"
                               "<link rel='stylesheet' href='/style.css'></head><body><main>",
                               HTTPD_RESP_USE_STRLEN);
     } else {
@@ -305,9 +307,11 @@ static esp_err_t send_page_start(httpd_req_t *req, const char *active, bool refr
                        "<a class='%s' href='/config'>Settings</a>"
                        "<a class='%s' href='/port-forward'>Port Forwarding</a>"
                        "<a class='%s' href='/diag'>Diagnostics</a>"
+                       "<a class='%s' href='/update'>Update</a>"
                        "</nav>",
                        strcmp(active, "dashboard") == 0 ? "on" : "", strcmp(active, "settings") == 0 ? "on" : "",
-                       strcmp(active, "ports") == 0 ? "on" : "", strcmp(active, "diag") == 0 ? "on" : "");
+                       strcmp(active, "ports") == 0 ? "on" : "", strcmp(active, "diag") == 0 ? "on" : "",
+                       strcmp(active, "update") == 0 ? "on" : "");
 }
 
 static void send_page_end(httpd_req_t *req)
@@ -350,7 +354,7 @@ static void send_saved_notice(httpd_req_t *req)
 static const char *normalize_return_path(const char *path)
 {
     if (strcmp(path, "/config") == 0 || strcmp(path, "/port-forward") == 0 || strcmp(path, "/diag") == 0 ||
-        strcmp(path, "/") == 0) {
+        strcmp(path, "/update") == 0 || strcmp(path, "/") == 0) {
         return path;
     }
     return "/";
@@ -486,9 +490,9 @@ static bool parse_port_u16(const char *text, uint16_t *out)
     return true;
 }
 
-static esp_err_t validate_port_forwards(httpd_req_t *req, const netlink_config_t *cfg)
+static esp_err_t validate_port_forwards(httpd_req_t *req, const taplink_config_t *cfg)
 {
-    for (int i = 0; i < NETLINK_MAX_PORT_FORWARDS; i++) {
+    for (int i = 0; i < TAPLINK_MAX_PORT_FORWARDS; i++) {
         const port_forward_rule_t *rule = &cfg->port_forwards[i];
         if (!rule->enabled) {
             continue;
@@ -527,9 +531,9 @@ static esp_err_t validate_port_forwards(httpd_req_t *req, const netlink_config_t
     return ESP_OK;
 }
 
-static esp_err_t parse_port_forward_rules(httpd_req_t *req, const char *body, netlink_config_t *cfg)
+static esp_err_t parse_port_forward_rules(httpd_req_t *req, const char *body, taplink_config_t *cfg)
 {
-    for (int i = 0; i < NETLINK_MAX_PORT_FORWARDS; i++) {
+    for (int i = 0; i < TAPLINK_MAX_PORT_FORWARDS; i++) {
         port_forward_rule_t *rule = &cfg->port_forwards[i];
         char key[16];
         char value[32];
@@ -582,7 +586,7 @@ static esp_err_t dashboard_handler(httpd_req_t *req)
 
     send_page_start(req, "dashboard", false);
     httpd_resp_send_chunk(req,
-                          "<div class='card'><h1>ESP32-NetLink</h1>"
+                          "<div class='card'><h1>ESP32-TapLink</h1>"
                           "<h2>DHCP Leases</h2>",
                           HTTPD_RESP_USE_STRLEN);
 
@@ -715,7 +719,7 @@ static esp_err_t config_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    netlink_config_t new_cfg = *s_cfg;
+    taplink_config_t new_cfg = *s_cfg;
 
     get_form_value(body, "wifi_ssid", new_cfg.wifi_ssid, sizeof(new_cfg.wifi_ssid));
 
@@ -823,7 +827,7 @@ static esp_err_t port_forward_get_handler(httpd_req_t *req)
                           "<tr><th>On</th><th>Listen</th><th>Target IP</th><th>Target</th></tr>",
                           HTTPD_RESP_USE_STRLEN);
 
-    for (int i = 0; i < NETLINK_MAX_PORT_FORWARDS; i++) {
+    for (int i = 0; i < TAPLINK_MAX_PORT_FORWARDS; i++) {
         char target_ip[16] = "";
         char listen_port[8] = "";
         char target_port[8] = "";
@@ -865,7 +869,7 @@ static esp_err_t port_forward_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    netlink_config_t new_cfg = *s_cfg;
+    taplink_config_t new_cfg = *s_cfg;
     if (parse_port_forward_rules(req, body, &new_cfg) != ESP_OK) {
         return ESP_FAIL;
     }
@@ -954,7 +958,7 @@ static esp_err_t rebooting_handler(httpd_req_t *req)
     httpd_resp_send_chunk(req, HTML_HEADER, HTTPD_RESP_USE_STRLEN);
     send_chunkf(req,
                 "<div class='card'><h1>Rebooting</h1>"
-                "<p class='muted'>Waiting for ESP32-NetLink to come back.</p>"
+                "<p class='muted'>Waiting for ESP32-TapLink to come back.</p>"
                 "<a class='btn secondary' href='%s'>Return</a></div>"
                 "<script>var target='%s';setTimeout(function "
                 "poll(){fetch(target,{cache:'no-store'})"
@@ -1147,9 +1151,197 @@ static esp_err_t diag_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---- OTA update ---- */
+
+static esp_err_t update_get_handler(httpd_req_t *req)
+{
+    if (!check_auth(req))
+        return send_auth_required(req);
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+
+    send_page_start(req, "update", false);
+    httpd_resp_send_chunk(req, "<div class='card'><h1>Firmware Update</h1>", HTTPD_RESP_USE_STRLEN);
+
+    send_chunkf(req,
+                "<table>"
+                "<tr><th>Version</th><td>%s</td></tr>"
+                "<tr><th>Running</th><td>%s</td></tr>"
+                "<tr><th>Update target</th><td>%s</td></tr>"
+                "</table>",
+                FIRMWARE_VERSION, running ? running->label : "?", next ? next->label : "none");
+
+    if (!next) {
+        httpd_resp_send_chunk(
+            req, "<p class='bad'>No OTA partition available. Flash a partition table with OTA support.</p>",
+            HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_send_chunk(req,
+                              "<label for='fw'>Select firmware (.bin)</label>"
+                              "<input type='file' id='fw' accept='.bin'>"
+                              "<div id='prog' style='display:none;margin:12px 0'>"
+                              "<div style='background:#e5e7eb;border-radius:6px;height:20px'>"
+                              "<div id='bar' style='background:#1f6feb;height:100%;border-radius:6px;"
+                              "width:0;transition:width .3s'></div></div>"
+                              "<p id='st' class='muted'>Uploading...</p></div>"
+                              "<button id='btn' onclick='doUp()'>Upload &amp; Update</button>"
+                              "<script>"
+                              "function doUp(){"
+                              "var f=document.getElementById('fw').files[0];"
+                              "if(!f){alert('Select a file');return}"
+                              "var b=document.getElementById('btn'),"
+                              "p=document.getElementById('prog'),"
+                              "bar=document.getElementById('bar'),"
+                              "st=document.getElementById('st');"
+                              "b.disabled=true;p.style.display='block';"
+                              "var x=new XMLHttpRequest();"
+                              "x.open('POST','/update',true);"
+                              "x.setRequestHeader('Content-Type','application/octet-stream');"
+                              "x.upload.onprogress=function(e){"
+                              "if(e.lengthComputable){"
+                              "var pct=Math.round(e.loaded/e.total*100);"
+                              "bar.style.width=pct+'%';"
+                              "st.textContent='Uploading: '+pct+'%'}};",
+                              HTTPD_RESP_USE_STRLEN);
+        httpd_resp_send_chunk(req,
+                              "x.onload=function(){"
+                              "if(x.status===200){"
+                              "st.textContent='Update complete! Rebooting...';"
+                              "bar.style.width='100%';bar.style.background='#047857';"
+                              "setTimeout(function(){location.href='/rebooting?return=/update'},1000)"
+                              "}else{"
+                              "st.textContent='Error: '+x.responseText;"
+                              "bar.style.background='#b91c1c';b.disabled=false}};"
+                              "x.onerror=function(){"
+                              "st.textContent='Upload failed (network error)';"
+                              "bar.style.background='#b91c1c';b.disabled=false};"
+                              "x.send(f)}</script>",
+                              HTTPD_RESP_USE_STRLEN);
+    }
+
+    httpd_resp_send_chunk(req, "</div>", HTTPD_RESP_USE_STRLEN);
+    send_page_end(req);
+    return ESP_OK;
+}
+
+static volatile bool s_ota_in_progress;
+
+#define OTA_BUF_SIZE 2048
+#define OTA_MAX_TIMEOUTS 5
+#define OTA_LOG_INTERVAL (100 * 1024)
+
+static esp_err_t update_post_handler(httpd_req_t *req)
+{
+    if (!check_auth(req))
+        return send_auth_required(req);
+
+    if (s_ota_in_progress) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "OTA already in progress");
+        return ESP_FAIL;
+    }
+
+    if (req->content_len == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No firmware data");
+        return ESP_FAIL;
+    }
+
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (!update_partition) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No OTA partition");
+        return ESP_FAIL;
+    }
+
+    if (req->content_len > update_partition->size) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Firmware too large for partition");
+        return ESP_FAIL;
+    }
+
+    s_ota_in_progress = true;
+    ESP_LOGI(TAG, "OTA start: %u bytes -> %s", (unsigned)req->content_len, update_partition->label);
+
+    esp_ota_handle_t ota_handle;
+    esp_err_t err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA begin failed");
+        s_ota_in_progress = false;
+        return ESP_FAIL;
+    }
+
+    char buf[OTA_BUF_SIZE];
+    size_t remaining = req->content_len;
+    size_t written = 0;
+    size_t next_log = OTA_LOG_INTERVAL;
+    int timeouts = 0;
+
+    while (remaining > 0) {
+        size_t to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
+        int received = httpd_req_recv(req, buf, to_read);
+        if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+            if (++timeouts >= OTA_MAX_TIMEOUTS) {
+                ESP_LOGE(TAG, "OTA timed out at %u/%u bytes", (unsigned)written, (unsigned)req->content_len);
+                esp_ota_abort(ota_handle);
+                httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Upload timed out");
+                s_ota_in_progress = false;
+                return ESP_FAIL;
+            }
+            continue;
+        }
+        if (received <= 0) {
+            ESP_LOGE(TAG, "OTA receive error at %u/%u bytes", (unsigned)written, (unsigned)req->content_len);
+            esp_ota_abort(ota_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive error");
+            s_ota_in_progress = false;
+            return ESP_FAIL;
+        }
+        timeouts = 0;
+
+        err = esp_ota_write(ota_handle, buf, (size_t)received);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+            esp_ota_abort(ota_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+            s_ota_in_progress = false;
+            return ESP_FAIL;
+        }
+
+        written += (size_t)received;
+        remaining -= (size_t)received;
+
+        if (written >= next_log) {
+            ESP_LOGI(TAG, "OTA progress: %u/%u bytes (%u%%)", (unsigned)written, (unsigned)req->content_len,
+                     (unsigned)(written * 100 / req->content_len));
+            next_log += OTA_LOG_INTERVAL;
+        }
+    }
+
+    err = esp_ota_end(ota_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Firmware validation failed");
+        s_ota_in_progress = false;
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to set boot partition");
+        s_ota_in_progress = false;
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "OTA complete: %u bytes written to %s", (unsigned)written, update_partition->label);
+    httpd_resp_sendstr(req, "OK");
+
+    xTaskCreate(reboot_task, "ota_reboot", 3072, NULL, 5, NULL);
+    return ESP_OK;
+}
+
 /* ---- Start ---- */
 
-esp_err_t web_server_start(netlink_config_t *cfg)
+esp_err_t web_server_start(taplink_config_t *cfg)
 {
     s_cfg = cfg;
 
@@ -1158,7 +1350,7 @@ esp_err_t web_server_start(netlink_config_t *cfg)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 8192;
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 16;
     httpd_handle_t server = NULL;
 
     esp_err_t err = httpd_start(&server, &config);
@@ -1212,6 +1404,16 @@ esp_err_t web_server_start(netlink_config_t *cfg)
         .method = HTTP_GET,
         .handler = rebooting_handler,
     };
+    const httpd_uri_t update_get = {
+        .uri = "/update",
+        .method = HTTP_GET,
+        .handler = update_get_handler,
+    };
+    const httpd_uri_t update_post = {
+        .uri = "/update",
+        .method = HTTP_POST,
+        .handler = update_post_handler,
+    };
 
     httpd_register_uri_handler(server, &dashboard);
     httpd_register_uri_handler(server, &style);
@@ -1222,6 +1424,8 @@ esp_err_t web_server_start(netlink_config_t *cfg)
     httpd_register_uri_handler(server, &diag);
     httpd_register_uri_handler(server, &reboot_post);
     httpd_register_uri_handler(server, &rebooting);
+    httpd_register_uri_handler(server, &update_get);
+    httpd_register_uri_handler(server, &update_post);
 
     ESP_LOGI(TAG, "Web server started on port %d", config.server_port);
     return ESP_OK;

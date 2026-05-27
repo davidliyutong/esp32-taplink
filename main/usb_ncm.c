@@ -202,7 +202,7 @@ static void usb_ncm_start_dhcps_if_needed(void)
     }
 }
 
-esp_netif_t *usb_ncm_netif_create(const netlink_config_t *cfg)
+esp_netif_t *usb_ncm_netif_create(const taplink_config_t *cfg)
 {
     uint8_t base_mac[6];
     esp_efuse_mac_get_default(base_mac);

@@ -13,7 +13,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     container:
-      image: espressif/esp-idf:v5.5.3
+      image: espressif/idf:v5.5.3
     steps:
       - uses: actions/checkout@v4
 
@@ -28,12 +28,12 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp build/esp32-netlink.bin dist/
-          tar czf dist/esp32-netlink.tar.gz \
-              -C build esp32-netlink.bin esp32-netlink.elf
+          cp build/esp32-taplink.bin dist/
+          tar czf dist/esp32-taplink.tar.gz \
+              -C build esp32-taplink.bin esp32-taplink.elf
 
       - uses: actions/upload-artifact@v4
         with:
-          name: esp32-netlink
-          path: dist/esp32-netlink.*
+          name: esp32-taplink
+          path: dist/esp32-taplink.*
           retention-days: 30

@@ -3,7 +3,7 @@
 #include "esp_err.h"
 #include <stdint.h>
 
-#define NETLINK_MAX_PORT_FORWARDS 4
+#define TAPLINK_MAX_PORT_FORWARDS 4
 
 typedef struct
 {
@@ -26,9 +26,9 @@ typedef struct
     uint8_t dhcp_dns_enabled;
     int8_t wifi_tx_power;
     uint8_t wifi_channel;
-    port_forward_rule_t port_forwards[NETLINK_MAX_PORT_FORWARDS];
-} netlink_config_t;
+    port_forward_rule_t port_forwards[TAPLINK_MAX_PORT_FORWARDS];
+} taplink_config_t;
 
-void config_get_defaults(netlink_config_t *cfg);
-esp_err_t config_load(netlink_config_t *cfg);
-esp_err_t config_save(const netlink_config_t *cfg);
+void config_get_defaults(taplink_config_t *cfg);
+esp_err_t config_load(taplink_config_t *cfg);
+esp_err_t config_save(const taplink_config_t *cfg);
