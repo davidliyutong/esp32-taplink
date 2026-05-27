@@ -14,6 +14,12 @@ USB NCM-to-WiFi AP network router for ESP32-S3. Plug in via USB — the host see
 └──────────┘                 └───────────┘                 └────────────┘
 ```
 
+## Screenshots
+
+![Dashboard showing DHCP leases](assets/imgs/screenshot-1.png)
+
+![Port forwarding settings](assets/imgs/screenshot-2.png)
+
 ## Features
 
 - **USB NCM gadget** — driverless on macOS/Linux, standard CDC-NCM on Windows
