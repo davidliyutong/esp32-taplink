@@ -3,13 +3,8 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_system.h"
-#include "esp_netif.h"
-#include "esp_netif_net_stack.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
-#include "freertos/semphr.h"
-#include "lwip/etharp.h"
-#include "lwip/tcpip.h"
 #include <string.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
@@ -140,89 +135,25 @@ static const char HTML_HEADER[] =
 
 static const char HTML_FOOTER[] = "</body></html>";
 
-/* ---- ARP client enumeration ---- */
-
-typedef struct {
-    uint32_t ip;
-    uint8_t mac[6];
-    const char *iface;
-} client_entry_t;
-
-typedef struct {
-    client_entry_t *out;
-    int max_clients;
-    struct netif *usb_lwip;
-    struct netif *wifi_lwip;
-    uint32_t usb_self_ip;
-    uint32_t wifi_self_ip;
-    int count;
-    SemaphoreHandle_t done;
-} arp_enum_ctx_t;
-
-static void arp_enum_fn(void *arg)
-{
-    arp_enum_ctx_t *ctx = (arp_enum_ctx_t *)arg;
-    ctx->count = 0;
-    for (size_t i = 0; i < ARP_TABLE_SIZE && ctx->count < ctx->max_clients; i++) {
-        ip4_addr_t *ip = NULL;
-        struct netif *netif = NULL;
-        struct eth_addr *mac = NULL;
-        if (etharp_get_entry(i, &ip, &netif, &mac)) {
-            const char *iface = NULL;
-            if (netif == ctx->usb_lwip && ip->addr != ctx->usb_self_ip) {
-                iface = "USB";
-            } else if (netif == ctx->wifi_lwip && ip->addr != ctx->wifi_self_ip) {
-                iface = "WiFi";
-            }
-            if (iface) {
-                ctx->out[ctx->count].ip = ip->addr;
-                ctx->out[ctx->count].iface = iface;
-                memcpy(ctx->out[ctx->count].mac, mac->addr, 6);
-                ctx->count++;
-            }
-        }
-    }
-    xSemaphoreGive(ctx->done);
-}
-
-static int get_clients(client_entry_t *out, int max_clients)
-{
-    esp_netif_t *usb = router_get_usb_netif();
-    esp_netif_t *wifi = router_get_wifi_netif();
-    if (!usb && !wifi) return 0;
-
-    struct netif *usb_lwip = usb ? esp_netif_get_netif_impl(usb) : NULL;
-    struct netif *wifi_lwip = wifi ? esp_netif_get_netif_impl(wifi) : NULL;
-    if (!usb_lwip && !wifi_lwip) return 0;
-
-    esp_netif_ip_info_t usb_ip = {0};
-    esp_netif_ip_info_t wifi_ip = {0};
-    if (usb) esp_netif_get_ip_info(usb, &usb_ip);
-    if (wifi) esp_netif_get_ip_info(wifi, &wifi_ip);
-
-    arp_enum_ctx_t ctx = {
-        .out = out,
-        .max_clients = max_clients,
-        .usb_lwip = usb_lwip,
-        .wifi_lwip = wifi_lwip,
-        .usb_self_ip = usb_ip.ip.addr,
-        .wifi_self_ip = wifi_ip.ip.addr,
-        .count = 0,
-        .done = xSemaphoreCreateBinary(),
-    };
-    if (!ctx.done) return 0;
-
-    if (tcpip_callback(arp_enum_fn, &ctx) == ERR_OK) {
-        xSemaphoreTake(ctx.done, portMAX_DELAY);
-    }
-    vSemaphoreDelete(ctx.done);
-    return ctx.count;
-}
-
 static void format_ipv4(uint32_t addr, char *out, size_t out_len)
 {
     uint8_t *ip = (uint8_t *)&addr;
     snprintf(out, out_len, "%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3]);
+}
+
+static void format_duration(uint32_t seconds, char *out, size_t out_len)
+{
+    uint32_t minutes = seconds / 60;
+    uint32_t hours = minutes / 60;
+
+    if (hours > 0) {
+        snprintf(out, out_len, "%uh %02um", (unsigned)hours,
+                 (unsigned)(minutes % 60));
+    } else if (minutes > 0) {
+        snprintf(out, out_len, "%um", (unsigned)minutes);
+    } else {
+        snprintf(out, out_len, "%us", (unsigned)seconds);
+    }
 }
 
 static void parse_subnet_field(const char *body, const char *key,
@@ -251,35 +182,39 @@ static esp_err_t dashboard_handler(httpd_req_t *req)
 {
     if (!check_auth(req)) return send_auth_required(req);
 
-    client_entry_t clients[10];
-    int client_count = get_clients(clients, 10);
+    router_dhcp_lease_t leases[ROUTER_MAX_DHCP_LEASES];
+    size_t lease_count = router_get_dhcp_leases(leases, ROUTER_MAX_DHCP_LEASES);
 
-    char page[3072];
+    char page[6144];
     int pos = 0;
 
     pos += snprintf(page + pos, sizeof(page) - pos,
         "%s<div class='card'><h1>ESP32-NetLink</h1>"
-        "<h2>Connected Devices</h2>",
+        "<h2>DHCP Leases</h2>",
         HTML_HEADER);
     if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
 
-    if (client_count == 0) {
+    if (lease_count == 0) {
         pos += snprintf(page + pos, sizeof(page) - pos,
-            "<p class='empty'>No devices connected</p>");
+            "<p class='empty'>No DHCP leases</p>");
         if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
     } else {
         pos += snprintf(page + pos, sizeof(page) - pos,
-            "<table><tr><th>Interface</th><th>IP Address</th><th>MAC Address</th></tr>");
+            "<table><tr><th>Interface</th><th>IP Address</th>"
+            "<th>MAC Address</th><th>Expires</th></tr>");
         if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
-        for (int i = 0; i < client_count && pos < (int)sizeof(page) - 128; i++) {
-            uint8_t *ip = (uint8_t *)&clients[i].ip;
-            uint8_t *m = clients[i].mac;
+        for (size_t i = 0; i < lease_count && pos < (int)sizeof(page) - 160; i++) {
+            uint8_t *ip = (uint8_t *)&leases[i].ip;
+            uint8_t *m = leases[i].mac;
+            char expires[16];
+            format_duration(leases[i].expires_in_seconds, expires, sizeof(expires));
             pos += snprintf(page + pos, sizeof(page) - pos,
                 "<tr><td>%s</td><td>%d.%d.%d.%d</td>"
-                "<td>%02x:%02x:%02x:%02x:%02x:%02x</td></tr>",
-                clients[i].iface,
+                "<td>%02x:%02x:%02x:%02x:%02x:%02x</td><td>%s</td></tr>",
+                leases[i].iface,
                 ip[0], ip[1], ip[2], ip[3],
-                m[0], m[1], m[2], m[3], m[4], m[5]);
+                m[0], m[1], m[2], m[3], m[4], m[5],
+                expires);
             if (pos >= (int)sizeof(page)) pos = sizeof(page) - 1;
         }
         pos += snprintf(page + pos, sizeof(page) - pos, "</table>");

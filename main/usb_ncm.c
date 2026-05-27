@@ -14,11 +14,26 @@ static const char *TAG = "usb_ncm";
 
 typedef struct {
     esp_netif_driver_base_t base;
-    uint8_t mac_addr[6];
+    uint8_t netif_mac_addr[6];
+    uint8_t usb_mac_addr[6];
 } usb_ncm_driver_t;
 
 static usb_ncm_driver_t s_driver;
 static volatile bool s_connected;
+
+static void usb_ncm_start_dhcps_if_needed(void);
+
+static void usb_ncm_make_local_mac(uint8_t out[6], const uint8_t base[6], uint8_t offset)
+{
+    memcpy(out, base, 6);
+
+    uint16_t low = (uint16_t)out[5] + offset;
+    out[5] = low & 0xFF;
+    out[4] = (uint8_t)(out[4] + (low >> 8));
+
+    out[0] |= 0x02;
+    out[0] &= ~0x01;
+}
 
 static esp_err_t usb_ncm_transmit(void *h, void *buffer, size_t len)
 {
@@ -58,6 +73,7 @@ static void usb_ncm_port_event_handler(void *arg, esp_event_base_t base, int32_t
     case ETHERNET_EVENT_CONNECTED:
         ESP_LOGI(TAG, "Port action: connected");
         esp_netif_action_connected(s_driver.base.netif, 0, 0, NULL);
+        usb_ncm_start_dhcps_if_needed();
         break;
     case ETHERNET_EVENT_DISCONNECTED:
         esp_netif_action_disconnected(s_driver.base.netif, 0, 0, NULL);
@@ -105,25 +121,40 @@ static esp_err_t usb_ncm_post_attach(esp_netif_t *esp_netif, void *args)
     };
     ESP_ERROR_CHECK(esp_netif_set_driver_config(esp_netif, &ifconfig));
 
-    esp_netif_set_mac(esp_netif, driver->mac_addr);
+    esp_netif_set_mac(esp_netif, driver->netif_mac_addr);
     return ESP_OK;
+}
+
+static void usb_ncm_start_dhcps_if_needed(void)
+{
+    esp_netif_dhcp_status_t status;
+    esp_err_t err = esp_netif_dhcps_get_status(s_driver.base.netif, &status);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "DHCP server status check failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    if (status == ESP_NETIF_DHCP_INIT || status == ESP_NETIF_DHCP_STOPPED) {
+        err = esp_netif_dhcps_start(s_driver.base.netif);
+        if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+            ESP_LOGE(TAG, "DHCP server start failed: %s", esp_err_to_name(err));
+        }
+    }
 }
 
 esp_netif_t *usb_ncm_netif_create(const netlink_config_t *cfg)
 {
     uint8_t base_mac[6];
     esp_efuse_mac_get_default(base_mac);
-    memcpy(s_driver.mac_addr, base_mac, 6);
-    s_driver.mac_addr[5] = (s_driver.mac_addr[5] + 4) & 0xFF;
-    s_driver.mac_addr[0] |= 0x02;
-    s_driver.mac_addr[0] &= ~0x01;
+    usb_ncm_make_local_mac(s_driver.netif_mac_addr, base_mac, 4);
+    usb_ncm_make_local_mac(s_driver.usb_mac_addr, base_mac, 5);
 
     esp_netif_ip_info_t ip_info;
     router_make_ip_info(cfg->usb_subnet, cfg->usb_prefix_len,
                         cfg->dhcp_gw_enabled, &ip_info);
 
     esp_netif_inherent_config_t base_cfg = {
-        .flags = ESP_NETIF_DHCP_SERVER,
+        .flags = ESP_NETIF_DHCP_SERVER | ESP_NETIF_FLAG_AUTOUP,
         .mac = {0},
         .ip_info = &ip_info,
         .get_ip_event = 0,
@@ -154,9 +185,13 @@ esp_netif_t *usb_ncm_netif_create(const netlink_config_t *cfg)
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID,
                                                 usb_ncm_port_event_handler, NULL));
 
-    ESP_LOGI(TAG, "USB NCM netif created, MAC=%02x:%02x:%02x:%02x:%02x:%02x",
-             s_driver.mac_addr[0], s_driver.mac_addr[1], s_driver.mac_addr[2],
-             s_driver.mac_addr[3], s_driver.mac_addr[4], s_driver.mac_addr[5]);
+    ESP_LOGI(TAG, "USB NCM netif created, netif MAC=%02x:%02x:%02x:%02x:%02x:%02x usb MAC=%02x:%02x:%02x:%02x:%02x:%02x",
+             s_driver.netif_mac_addr[0], s_driver.netif_mac_addr[1],
+             s_driver.netif_mac_addr[2], s_driver.netif_mac_addr[3],
+             s_driver.netif_mac_addr[4], s_driver.netif_mac_addr[5],
+             s_driver.usb_mac_addr[0], s_driver.usb_mac_addr[1],
+             s_driver.usb_mac_addr[2], s_driver.usb_mac_addr[3],
+             s_driver.usb_mac_addr[4], s_driver.usb_mac_addr[5]);
     return netif;
 }
 
@@ -171,7 +206,7 @@ esp_err_t usb_ncm_start(void)
         .on_init_callback = usb_ncm_init_cb,
         .user_context = &s_driver,
     };
-    memcpy(net_cfg.mac_addr, s_driver.mac_addr, 6);
+    memcpy(net_cfg.mac_addr, s_driver.usb_mac_addr, 6);
     ESP_ERROR_CHECK(tinyusb_net_init(&net_cfg));
 
     void *handle = &s_driver;

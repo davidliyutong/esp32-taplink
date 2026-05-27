@@ -4,7 +4,17 @@
 #include "esp_netif.h"
 #include "nvs_config.h"
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+#define ROUTER_MAX_DHCP_LEASES 16
+
+typedef struct {
+    uint32_t ip;
+    uint8_t mac[6];
+    const char *iface;
+    uint32_t expires_in_seconds;
+} router_dhcp_lease_t;
 
 uint32_t router_prefix_to_netmask(uint8_t prefix_len);
 void router_make_ip_info(uint32_t subnet, uint8_t prefix_len, bool advertise_gw,
@@ -16,3 +26,4 @@ esp_err_t router_start(esp_netif_t *usb_netif, esp_netif_t *wifi_netif,
                        const netlink_config_t *cfg);
 esp_netif_t *router_get_usb_netif(void);
 esp_netif_t *router_get_wifi_netif(void);
+size_t router_get_dhcp_leases(router_dhcp_lease_t *out, size_t max_leases);
