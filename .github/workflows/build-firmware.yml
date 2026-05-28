@@ -37,3 +37,9 @@ jobs:
           name: esp32-taplink
           path: dist/esp32-taplink.*
           retention-days: 30
+
+      - name: Upload release assets
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/esp32-taplink.*

@@ -5,14 +5,22 @@
 ![Target](https://img.shields.io/badge/target-ESP32--S3-green)
 ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-USB NCM-to-WiFi AP network router for ESP32-S3. Plug in via USB — the host sees a standard CDC-NCM Ethernet adapter; the ESP32 runs a SoftAP and routes IP traffic between the two interfaces.
+Pocket-sized out-of-band WiFi access for headless servers and workstations. Plug ESP32-TapLink into a server's USB port and it appears as a standard CDC-NCM USB Ethernet adapter; the device runs its own WiFi access point and routes IP traffic between USB and WiFi, so you can SSH into the host from a laptop or phone even when the primary network is down. A low-cost, userland alternative to IPMI/BMC for machines without lights-out management.
 
 ```
-┌──────────┐     USB NCM     ┌───────────┐     WiFi AP     ┌────────────┐
-│   Host   │────────────────▶│  ESP32-S3 │◀────────────────│  Clients   │
-│  (DHCP)  │  192.168.5.0/24 │  (router) │ 192.168.4.0/24  │   (DHCP)   │
-└──────────┘                 └───────────┘                 └────────────┘
+┌─────────────────────┐   USB NCM    ┌───────────┐   WiFi AP    ┌──────────────────┐
+│  Headless server /  │─────────────▶│  ESP32-S3 │◀─────────────│  Laptop / phone  │
+│     workstation     │ 192.168.5.0  │  (router) │ 192.168.4.0  │      (SSH)       │
+└─────────────────────┘    /24       └───────────┘    /24       └──────────────────┘
 ```
+
+## Use cases
+
+- **Recover a headless server when the LAN is down** — SSH in over the ESP32's own WiFi AP without touching the upstream network.
+- **First-boot setup for workstations, NAS, or appliances** — assign an IP over USB, run the installer or reach the web UI, then unplug when the box is on the network.
+- **Cheap post-boot OOB for hardware without IPMI / iDRAC / iLO / AMT** — useful for desktop CPUs, Mini-PCs, and SBCs that lack lights-out management.
+
+> Scope: this is **post-boot / userland** out-of-band access — the host OS must be running with USB CDC-NCM drivers loaded (default on macOS, Linux, and Windows 10+). It does not provide power control, KVM video, or pre-boot/BIOS access.
 
 ## Screenshots
 
@@ -57,7 +65,13 @@ make build
 make flash          # or: make flash-monitor
 ```
 
-After flashing, the device appears as a USB Ethernet adapter. Connect to the WiFi AP (default SSID: `ESP32-TapLink`, password: `12345678`) or open `http://192.168.5.1` from the USB side / `http://192.168.4.1` from the WiFi side for the web UI. Default Basic Auth credentials are `admin` / `admin`.
+After flashing, plug ESP32-TapLink into the target server's USB port — the host gets an IP in `192.168.5.0/24` via DHCP-over-USB. From your laptop or phone, join the WiFi AP (default SSID `ESP32-TapLink`, password `12345678`, which puts you on `192.168.4.0/24`) and SSH into the server:
+
+```bash
+ssh user@192.168.5.2    # first DHCP lease on the USB side
+```
+
+Traffic is routed at L3 from WiFi to USB by the ESP32. The web UI is at `http://192.168.5.1` (USB side) or `http://192.168.4.1` (WiFi side); default Basic Auth credentials are `admin` / `admin`.
 
 ## Build Commands
 
@@ -98,3 +112,7 @@ Config changes via the web UI are saved with `config_save()` and then redirect t
 | Button | GPIO 0 (boot button, factory reset on 5 s hold) |
 
 Firmware version is derived from `git describe --tags` at CMake configure time.
+
+---
+
+<sub>**Keywords:** out-of-band management, OOB, post-boot OOB, IPMI alternative, BMC alternative, headless server, headless workstation, remote SSH over WiFi, USB Ethernet gadget, USB-to-WiFi bridge, ESP32-S3, TinyUSB NCM, CDC-NCM, homelab, datacenter, console server, server recovery, crash cart, lights-out.</sub>
